@@ -87,9 +87,10 @@ decomposition internally for per-class AUC, sensitivity, and specificity.
 
 **Required only when** `feature_reduction_method: "apriori"`.
 
-**Format:** 2-column CSV, no header (first row is ignored). Column 1: feature name
-(must exactly match column names in `data_file`). Column 2: cluster label (any
-hashable type; strings and integers both accepted).
+**Format:** 2-column CSV with no header row. All rows are treated as data.
+Column 1: feature name (must exactly match column names in `data_file`).
+Column 2: cluster label (any hashable type; strings and integers both accepted).
+Do not include a header row; all rows are read as feature-to-cluster mappings.
 
 **Constraint:** Every brain feature column in `data_file` (after substring filtering)
 must have an entry in this file. A `ValueError` is raised for any unmatched features.
@@ -119,7 +120,9 @@ must have an entry in this file. A `ValueError` is raised for any unmatched feat
 
 Number of CPU cores for joblib `Parallel`. Should match `cpus_per_task` in the
 SLURM wrapper. Controls parallelism in permutation tests, bootstrap, and inner CV.
-In `perm_worker` mode, `n_jobs` is set to `1` per-task to avoid nested parallelism.
+Inner CV parallelism (`RandomizedSearchCV.n_jobs`) is set to 1 inside permutation
+and block permutation fold loops to avoid nested parallelism with the outer
+`joblib.Parallel` loop, which uses `n_cores`.
 
 ### `data_cols` Section
 
@@ -253,7 +256,9 @@ Block permutation p-values use a one-sided Laplace-corrected test:
 - Reads CSV via `pd.read_csv`; raises `FileNotFoundError` if absent.
 - Listwise deletion: drops rows with any `NaN`. Logs count of dropped rows.
 - Isolates outcome (`Y`), subject IDs, sample weights (if specified), covariates, and brain features.
-- When `covariate_method: "none"`, forces `covariate_penalty_weights = [1.0]` in config.
+- When `covariate_method: "none"`, `cov_scaler__penalty_weight` is excluded from the
+  hyperparameter search (covariate indices are empty). The `CovariateScaler` defaults to
+  `penalty_weight=1.0` (no-op).
 - Computes and logs top-10 absolute univariate Spearman correlations between brain features
   and outcome as a data sanity check (uses first column for multi-task outcome).
 - Logs N:P diagnostic: warns if `P_brain > N/5`.
@@ -365,7 +370,7 @@ Primary performance metric:
 - Setup: calls `_fit_full_data_model` to fit reducer on full data and tune hyperparameters
 - Per iteration (n_bootstraps total, `RandomState(43)` seed sequence):
   1. Subsample 50% of subjects without replacement
-  2. Fit fresh reducer clone on subsampled brain features (Approach Y)
+  2. Fit fresh reducer clone on subsampled brain features (per-iteration re-reduction)
   3. Fit model with `best_params` (fixed hyperparameters — no re-tuning)
   4. Back-project `coef_ != 0` indicators to original feature space via
      `_backproject_coef_original_space`
@@ -377,7 +382,7 @@ Primary performance metric:
 
 ### Step 7: Bootstrap Importance (`run_bootstrap`)
 
-**Approach Y conditional bootstrap** (Efron & Tibshirani, 1993, Ch. 13):
+**Per-iteration re-reduction conditional bootstrap** (Efron & Tibshirani, 1993, Ch. 13):
 - Setup: calls `_fit_full_data_model`; saves `reducer_full`, `best_params`, `feat_std_map`
 - Per iteration (`_boot_task`):
   1. Weight-aware bootstrap resample with replacement (uses `weights` probability vector

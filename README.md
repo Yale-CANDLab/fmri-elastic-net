@@ -132,8 +132,10 @@ It controls both the L1 ratio search space and the implicit regularization philo
 ### `correlate` — Ridge-dominant elastic net
 
 - L1 ratio search space: 0.001–0.2 (dense, shrinkage-focused solutions)
-- Model performance evaluated via internal validity
-- Emphasis on stable coefficient estimation and multicollinear feature sets
+- Emphasis on stable coefficient estimation; Ridge-dominant regularization reduces variance
+  at the cost of sparsity, suitable for multicollinear feature sets
+- Model performance is still evaluated via nested CV on held-out folds (external validity);
+  the primary goal is reliable feature attribution rather than prediction accuracy
 - **Best use case:** small-to-medium samples (N ~ 100s) where overfitting is a concern;
   brain connectivity/activation data with high inter-feature correlation; scenarios where
   interpretability of all features is desired rather than sparse selection
@@ -183,10 +185,10 @@ shuffled outcome labels. P-value uses Laplace correction:
 `(count(null ≥ observed) + 1) / (n_permutations + 1)`.
 
 ### Feature importance
-Bootstrap confidence intervals (Approach Y conditional bootstrap): each iteration fits
-a fresh reducer clone on resampled brain features, fits the model using hyperparameters
-fixed from full-data tuning, and back-projects coefficients to the original feature
-space for aggregation. This ensures meaningful CI and pd computation across iterations
+Bootstrap confidence intervals (per-iteration re-reduction conditional bootstrap, Efron & Tibshirani, 1993, Ch. 13):
+each iteration fits a fresh reducer clone on resampled brain features, fits the model using
+hyperparameters fixed from full-data tuning, and back-projects coefficients to the original
+feature space for aggregation. This ensures meaningful CI and pd computation across iterations
 with different reduced spaces.
 
 - **`is_significant`**: primary criterion — CI does not cross zero
