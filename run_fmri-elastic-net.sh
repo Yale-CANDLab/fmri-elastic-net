@@ -6,8 +6,6 @@
 # 1. PARTITION variable below is set to your cluster's partition name
 # 2. ENV_SETUP below is updated with any module load commands required by your HPC environment
 # 3. Access to fmri-elastic-net conda environment (create with environment.yaml)
-
-# Last updated: 03/12/2026
 # =================================================================
 
 # ARGUMENT PARSING

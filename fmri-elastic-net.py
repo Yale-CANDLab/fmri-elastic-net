@@ -5,9 +5,9 @@ FEATURES:
 - Flexible data loading (covariates + brain features) with listwise deletion and N:P diagnostics.
 - Feature Reduction: Raw Features, HDBSCAN Clustering + PCA, Apriori Clustering, ICA.
   All reduction methods are applied fold-locally inside the CV loop to prevent data leakage.
-- Approach Y Bootstrap: each iteration fits a fresh reducer clone on resampled brain features,
-  fits the model in reduced space with fixed hyperparameters, and back-projects coefficients
-  to the invariant original feature space for meaningful aggregation across iterations.
+- Per-iteration re-reduction bootstrap: each iteration fits a fresh reducer clone on resampled
+  brain features, fits the model in reduced space with fixed hyperparameters, and back-projects
+  coefficients to the invariant original feature space for meaningful aggregation across iterations.
 - Covariate Handling: Incorporate, Pre-Regress (Cross-Val), or None.
 - Two modes for Analysis: Predict (full elastic net spectrum, L1 0.01–0.99, data-driven) vs. Correlate (Ridge-dominant, L1 0.001–0.2).
 - Validation: Supports Repeated K-Fold and LOO for small datasets.
@@ -26,12 +26,11 @@ STATISTICAL NOTES:
   is the primary inference criterion and is unaffected by zero-inflation. The p_value
   and is_significant_fdr columns are complementary and should be interpreted alongside
   is_significant (Makowski et al., 2019).
-- Bootstrap importance (Approach Y): each iteration fits a fresh reducer clone on resampled
-  brain features, fits the model in reduced space using fixed hyperparameters (conditional
-  bootstrap, Efron & Tibshirani, 1993, Ch. 13), and back-projects coefficients to the
-  invariant original brain feature space via _backproject_coef_original_space. CIs may
-  be marginally narrower than a full double-bootstrap that re-tunes hyperparameters per
-  iteration.
+- Bootstrap importance (per-iteration re-reduction conditional bootstrap, Efron & Tibshirani,
+  1993, Ch. 13): each iteration fits a fresh reducer clone on resampled brain features, fits
+  the model in reduced space using fixed hyperparameters, and back-projects coefficients to the
+  invariant original brain feature space via _backproject_coef_original_space. CIs may be
+  marginally narrower than a full double-bootstrap that re-tunes hyperparameters per iteration.
 - raw_coef_mean with reduction methods (cluster_pca, apriori, ica) is approximate: the
   back-projected standardized coefficient is divided by original-feature SD, which is not
   equivalent to a standardized beta from direct regression on original features. The
@@ -318,7 +317,7 @@ class AprioriTransformer(_ClusterPCABase):
 
 class ICATransformer(BaseEstimator, TransformerMixin):
     """
-    Fit FastICA (Option A: whiten='unit-variance') directly on standardized features.
+    Fit FastICA with unit-variance whitening directly on standardized features.
     No intermediate PCA step; mixing_unnorm_ = ica_.mixing_ maps IC space to
     standardized feature space (shape P x K) for back-projection.
     Applied inside the CV loop to prevent leakage.
@@ -350,7 +349,7 @@ class ICATransformer(BaseEstimator, TransformerMixin):
             K = int(n_comp_cfg)
         self.scaler_ = StandardScaler().fit(X_df)
         X_std = self.scaler_.transform(X_df)
-        # Option A: FastICA with unit-variance whitening acts directly on standardized
+        # FastICA with unit-variance whitening acts directly on standardized
         # features. mixing_ is P x K and maps IC activations back to feature space.
         self.ica_ = FastICA(
             n_components=K,
@@ -490,10 +489,18 @@ def load_and_prep_data(config, output_dir):
         f"Initial Load: {len(Y)} samples. {len(active_covs)} Covariates, {len(brain_cols)} Brain Features."
     )
 
-    # Sanity Check
-    corrs = X_brain.corrwith(Y if Y.ndim == 1 else Y.iloc[:, 0])
-    top_10 = corrs.abs().sort_values(ascending=False).head(10)
-    logging.info(f"--- Data Sanity Check: Top 10 Univariate Correlations ---\n{top_10}")
+    # Sanity Check — top-10 absolute univariate Pearson and Spearman correlations
+    Y_vec = Y if Y.ndim == 1 else Y.iloc[:, 0]
+    pearson_corrs = X_brain.corrwith(Y_vec, method='pearson')
+    spearman_corrs = X_brain.corrwith(Y_vec, method='spearman')
+    top_10_pearson = pearson_corrs.abs().sort_values(ascending=False).head(10)
+    top_10_spearman = spearman_corrs.abs().sort_values(ascending=False).head(10)
+    logging.info(
+        f"--- Data Sanity Check: Top 10 Absolute Univariate Pearson Correlations ---\n{top_10_pearson}"
+    )
+    logging.info(
+        f"--- Data Sanity Check: Top 10 Absolute Univariate Spearman Correlations ---\n{top_10_spearman}"
+    )
 
     # Load apriori map if needed (reduction itself applied inside CV)
     red_method = config['feature_reduction_method']
@@ -1229,7 +1236,7 @@ def _fit_full_data_model(config, X_brain, Y, weights, X_cov, active_covs, aprior
 def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=None):
     """Bootstrap selection frequency: a descriptive measure of feature inclusion robustness.
 
-    Approach Y: each subsample iteration fits a fresh reducer clone on
+    Per-iteration re-reduction: each subsample iteration fits a fresh reducer clone on
     the subsampled brain features, fits the model in reduced space with fixed
     hyperparameters (tuned on full data), back-projects selection indicators to the
     invariant original feature space using _backproject_coef_original_space.
@@ -1258,7 +1265,7 @@ def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apr
         rng_sub = np.random.RandomState(seed)
         idx = rng_sub.choice(len(Y), len(Y) // 2, replace=False)
 
-        # Resample brain features, fit fresh reducer (Approach Y)
+        # Resample brain features, fit fresh reducer clone (per-iteration re-reduction)
         X_brain_sub = X_brain.iloc[idx].reset_index(drop=True)
         reducer_sub = None
         if reducer_template is not None:
@@ -1354,7 +1361,7 @@ def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apr
 # --- Step 7: Bootstrap & Reporting ---
 def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
                apriori_map=None, X_cov=None, active_covs=None):
-    """Single bootstrap iteration (Approach Y: per-iteration reduction + back-projection).
+    """Single bootstrap iteration (per-iteration re-reduction + back-projection).
 
     Each iteration: (1) weight-aware resample, (2) fit fresh reducer clone on
     resampled brain features, (3) fit model in reduced space using best_params
@@ -1606,11 +1613,11 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_
 
     Notes
     -----
-    With Approach Y (per-iteration reduction + back-projection), df_coef is always
-    in the original brain feature space. When feature_reduction_method != 'none',
-    df_coef contains only brain features (no covariates), so the covariate penalty-
-    weight adjustment is only applied when the df_coef columns match the full
-    model feature set (i.e., feature_reduction_method == 'none').
+    With per-iteration re-reduction (conditional bootstrap, Efron & Tibshirani, 1993,
+    Ch. 13), df_coef is always in the original brain feature space. When
+    feature_reduction_method != 'none', df_coef contains only brain features (no
+    covariates), so the covariate penalty-weight adjustment is only applied when the
+    df_coef columns match the full model feature set (i.e., feature_reduction_method == 'none').
     """
     out_dir = config['paths']['output_dir']
     alpha = 1.0 - config['stats_params']['ci_level']
@@ -1618,7 +1625,7 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_
     std_ci_low = df_coef.quantile(alpha / 2)
     std_ci_high = df_coef.quantile(1 - alpha / 2)
 
-    # Align feat_std_map to df_coef columns (may differ after Approach Y back-projection)
+    # Align feat_std_map to df_coef columns (may differ after per-iteration back-projection)
     feat_std_map_aligned = feat_std_map.reindex(df_coef.columns).fillna(1.0)
 
     pw = best_model.named_steps['cov_scaler'].penalty_weight
@@ -1648,14 +1655,14 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
     """Apriori: individual feature report + network-level aggregation via apriori cluster map.
 
-    With Approach Y, df_coef is in original brain feature space. Network-level
+    With per-iteration re-reduction, df_coef is in original brain feature space. Network-level
     statistics are produced by aggregating individual feature bootstrap distributions
     to cluster level using the apriori map from reducer_full (mean coefficient per cluster).
     """
     out_dir = stats['out_dir']
     alpha = stats['alpha']
 
-    # --- Individual feature report (Approach Y: df_coef already in original space) ---
+    # --- Individual feature report (df_coef is in original brain feature space after per-iteration back-projection) ---
     indiv_df = _build_individual_report_df(all_feats, stats)
     indiv_df.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
 
@@ -1695,9 +1702,9 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
 
 def _report_cluster_pca(df_coef, all_feats, stats, config, active_covs,
                         reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """Cluster PCA: individual feature report in original feature space (Approach Y).
+    """Cluster PCA: individual feature report in original feature space (per-iteration re-reduction).
 
-    With Approach Y, df_coef is already in original brain feature space after
+    With per-iteration re-reduction, df_coef is already in original brain feature space after
     back-projection in each bootstrap iteration. Report feature-level statistics directly.
     """
     out_dir = stats['out_dir']
@@ -1711,9 +1718,9 @@ def _report_cluster_pca(df_coef, all_feats, stats, config, active_covs,
 
 def _report_ica(df_coef, all_feats, stats, config, active_covs,
                 reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """ICA: individual feature report in original feature space (Approach Y).
+    """ICA: individual feature report in original feature space (per-iteration re-reduction).
 
-    With Approach Y, each bootstrap iteration back-projects IC-space coefficients
+    With per-iteration re-reduction, each bootstrap iteration back-projects IC-space coefficients
     to original brain feature space using the activation pattern (Haufe et al., 2014):
        feature_coef = A @ beta_IC  (A = mixing_unnorm_, shape P x K_ic)
     df_coef is therefore already in original brain feature space — report directly.
@@ -1770,7 +1777,7 @@ def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_
 
 
 def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, apriori_map=None):
-    """Run Approach Y bootstrap importance estimation.
+    """Run per-iteration re-reduction bootstrap importance estimation (conditional bootstrap, Efron & Tibshirani, 1993, Ch. 13).
 
     Setup: fits reducer and tunes hyperparameters once on the full dataset
     (descriptive pathway) to establish best_params and feat_std_map.
@@ -1845,7 +1852,7 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         feat_std_map_report = feat_std_map
         all_feats_report = full_feat_names
     else:
-        # For reduction cases, df_coef is in original brain feature space (Approach Y).
+        # For reduction cases, df_coef is in original brain feature space (per-iteration re-reduction).
         # Use X_brain std as feat_std proxy (scaler was fit on reduced-space features).
         # NOTE: std_coef_mean is APPROXIMATE after back-projection — it represents the
         # product of reduced-space standardized coef × loading, divided by original feature

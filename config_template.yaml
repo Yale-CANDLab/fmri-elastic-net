@@ -7,7 +7,7 @@ analysis_type: "classification"
 # Analysis Mode:
 # "predict" or "correlate"
 # "predict" determines model and feature significance via external validity/generalization (powerful, high 'significance' threshold, requires large samples N~1000s)
-# "correlate" determines model and feature significance via internal validity (less powerful, lower 'significance' threshold, more appropriate for small samples N~100s)
+# "correlate" uses Ridge-dominant regularization (L1 ratio 0.001–0.2) to prioritize stable coefficient estimation over sparse feature selection. More appropriate for small samples N~100s. Model performance still evaluated via nested CV.
 analysis_mode: "correlate"
 
 # Covariate Method:
@@ -36,7 +36,7 @@ paths:
   output_dir: "/absolute/output/run/path/here"
   
   # Required if feature_reduction_method is "apriori"
-  # Path to a 2-column CSV containing feature names (MUST correspond to features in data_file) and cluster labels. Header is ignored.
+  # Path to a 2-column CSV containing feature names (MUST correspond to features in data_file) and cluster labels. No header row; all rows are treated as data (feature name, cluster label).
   apriori_clustering_file: null
 
 # CPU Parallelization
@@ -176,6 +176,7 @@ block_permutation_tests:
   # The 'label' for this test, followed by a substring identifier for included features
   brain_block: "brain"
 
-  # add other explicit blocks with lists is option
-  # pre_score_only:
-  #   - "ViewNeg"
+  # add other explicit blocks with lists as an option
+  # roi_block:
+  #   - "roi_vmPFC"
+  #   - "roi_amygdala"
