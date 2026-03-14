@@ -160,8 +160,7 @@ stats_params:
   n_permutations: 10000
   
   # Per-fold bootstrap budget for feature/cluster importance (Tier 2 inference).
-  # Total iterations = K_outer x n_fold_bootstraps (distributed evenly across all
-  # outer folds and CV repeats; minimum 50 iterations per fold-repeat).
+  # Total iterations = K_outer x n_fold_bootstraps (distributed evenly across all outer folds).
   # Replaces n_bootstraps (deprecated; still accepted with a warning).
   n_fold_bootstraps: 500
   

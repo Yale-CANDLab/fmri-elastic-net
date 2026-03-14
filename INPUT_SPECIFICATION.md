@@ -315,7 +315,7 @@ refit independently per CV fold (or per bootstrap/subsample iteration).
 4. Stores unnormalized mixing matrix as `mixing_unnorm_` (shape P × K).
 5. `transform` applies `scaler` then `ica_.transform` to produce IC activations.
 
-**Descriptor-stage behavior:** For selection frequency and bootstrap (Steps 6–7),
+**Descriptor-stage behavior:** For selection frequency and bootstrap (Steps 7–8),
 reducers are fit on the full dataset. A log message explicitly flags this distinction
 from the fold-local inferential pathway.
 
