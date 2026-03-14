@@ -5,17 +5,32 @@ FEATURES:
 - Flexible data loading (covariates + brain features) with listwise deletion and N:P diagnostics.
 - Feature Reduction: Raw Features, HDBSCAN Clustering + PCA, Apriori Clustering, ICA.
   All reduction methods are applied fold-locally inside the CV loop to prevent data leakage.
+- Fold-wise Ensemble Architecture: run_nested_cv stores all K fold models (reducer +
+  fitted pipeline + best_params + back-projected coefficients per fold). The ensemble IS the
+  collection of evaluated fold models — there is no separate full-data model, eliminating
+  the evaluation-inference disconnect present in full-data descriptive approaches.
+- Two-Tier Inference Framework:
+    Tier 1 (fold-level t-test): one-sample t-test across K fold-specific coefficient vectors
+    per feature. Captures both sampling and hyperparameter tuning variance. Written to
+    report_fold_ensemble_importance.csv.
+    Tier 2 (pooled fold-wise bootstrap): n_fold_bootstraps iterations distributed evenly
+    across all K folds (minimum 50 per fold); coefficients pooled for percentile CIs.
+    Distribution-shape-agnostic; detects non-normality and zero-inflation. Written to
+    report_fold_bootstrap_ci.csv.
 - Per-iteration re-reduction bootstrap: each iteration fits a fresh reducer clone on resampled
-  brain features, fits the model in reduced space with fixed hyperparameters, and back-projects
-  coefficients to the invariant original feature space for meaningful aggregation across iterations.
+  brain features, fits the model in reduced space with fold-specific fixed hyperparameters, and
+  back-projects coefficients to the invariant original feature space for meaningful aggregation.
 - Covariate Handling: Incorporate, Pre-Regress (Cross-Val), or None.
-- Two modes for Analysis: Predict (full elastic net spectrum, L1 0.01–0.99, data-driven) vs. Correlate (Ridge-dominant, L1 0.001–0.2).
+- Multi-task Weighted Regression: sqrt(w_i) pre-transformation applied for MultiTaskElasticNet
+  + sample_weight (algebraically equivalent to weighted loss; sklearn native sample_weight
+  used for all other model types). Implemented via WeightTransformer pipeline step.
+- Two modes for Analysis: Predict (full elastic net spectrum, L1 0.01–0.99, data-driven)
+  vs. Correlate (Ridge-dominant, L1 0.001–0.2).
 - Validation: Supports Repeated K-Fold and LOO for small datasets.
-- Statistical Inference: Bootstrap CIs + Probability of Direction (pd) + BH-FDR correction.
 - Comprehensive Evaluation Metrics: RMSE/MAE/R²/Pearson r (regression); AUC-ROC/Log-Loss/
   Sensitivity/Specificity/Balanced Accuracy (classification). Written to model_performance.csv.
 - Outputs: Standardized AND approximate Raw Coefficients; distribution archives when save_distributions=true.
-- Multi-task regression foundational support (MultiTaskElasticNet; per-task reporting).
+- Multi-task regression support (MultiTaskElasticNet; per-task reporting).
 - Full Compatibility: Classification (AUC/LogLoss) & Regression (RMSE/R2).
 
 STATISTICAL NOTES:
@@ -26,11 +41,22 @@ STATISTICAL NOTES:
   is the primary inference criterion and is unaffected by zero-inflation. The p_value
   and is_significant_fdr columns are complementary and should be interpreted alongside
   is_significant (Makowski et al., 2019).
-- Bootstrap importance (per-iteration re-reduction conditional bootstrap, Efron & Tibshirani,
-  1993, Ch. 13): each iteration fits a fresh reducer clone on resampled brain features, fits
-  the model in reduced space using fixed hyperparameters, and back-projects coefficients to the
-  invariant original brain feature space via _backproject_coef_original_space. CIs may be
-  marginally narrower than a full double-bootstrap that re-tunes hyperparameters per iteration.
+- Two-tier inference design: Tier 1 (fold-level t-test) and Tier 2 (pooled bootstrap
+  percentile CIs) have complementary sensitivity profiles. Tier 1 is intentionally
+  anti-conservative: within-fold training set overlap (~(K-1)/K for K-fold CV) induces
+  positive correlation between fold coefficient estimates, underestimating SE (Bengio &
+  Grandvalet, 2004). This produces a liberal screening test. Tier 2 is conservative due
+  to L1 zero-inflation — features with moderate effects are zeroed in a substantial
+  fraction of bootstrap iterations, pulling CIs toward zero. The scientific value lies in
+  concordance: features significant in both tiers are high-confidence; features significant
+  only in Tier 1 are candidates warranting further investigation. Making Tier 1
+  better-calibrated (e.g., via Nadeau-Bengio correction or repeated outer CV) would
+  converge the two tiers toward the same sensitivity profile, eliminating the
+  screening/confirmation distinction.
+- Tier 2 bootstrap CIs are computed from a mixture of iterations with different
+  hyperparameter configurations (fold-specific best_params). Percentile CIs from this
+  mixture may have sub-nominal coverage; they are best interpreted as sensitivity
+  diagnostics (Efron & Tibshirani, 1993, Ch. 13).
 - raw_coef_mean with reduction methods (cluster_pca, apriori, ica) is approximate: the
   back-projected standardized coefficient is divided by original-feature SD, which is not
   equivalent to a standardized beta from direct regression on original features. The
@@ -39,9 +65,22 @@ STATISTICAL NOTES:
   2014, NeuroImage) rather than the filter pattern (pinv(A) @ beta_IC). Activation
   patterns represent signal co-variation in feature space and are more interpretable and
   stable for neuroimaging feature attribution.
-- Selection frequency hyperparameters are fixed from full-N tuning; each N/2 subsample
-  sees weaker regularization, which may inflate absolute selection frequencies. Relative
-  ordering is preserved; no significance threshold is applied (Meinshausen & Bühlmann, 2010).
+- Selection frequency uses fold-specific best_params; each N/2 subsample sees weaker
+  regularization than the full-N tuned model, which may inflate absolute selection
+  frequencies. Relative ordering is preserved; no significance threshold is applied
+  (Meinshausen & Bühlmann, 2010, JRSS-B).
+- Multi-task weighted regression: sqrt(w_i) scaling of X and Y is equivalent to
+  weighted least squares in the loss term only. The L1+L2 penalty term is invariant to
+  the transformation — this is appropriate because regularization controls model
+  complexity independently of observation representativeness. Alpha is re-tuned on
+  the transformed data by RandomizedSearchCV (Efron & Hastie, 2021, Ch. 7).
+- StandardScaler uses unweighted sample moments (mean and variance) before the
+  sqrt(w) WeightTransformer step. This is an intentional design choice: standardization
+  is a numerical conditioning step and alpha is re-tuned on the transformed data to
+  compensate for scale changes. For typical inverse probability weighting (IPW) ranges
+  (~0.5–5.0) the effect on coefficient estimates is negligible. For extreme weight
+  ranges (e.g., 0.01–100.0), consider pre-standardizing features using weighted mean
+  and variance before pipeline execution.
 
 Written by: Taylor J. Keding, Ph.D.
 """
@@ -53,6 +92,7 @@ import yaml
 import logging
 import warnings
 import argparse
+from math import ceil
 
 # Data Handling
 import pandas as pd
@@ -82,7 +122,8 @@ from sklearn.metrics import (
     log_loss, balanced_accuracy_score, recall_score, confusion_matrix
 )
 from sklearn.exceptions import ConvergenceWarning
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, ttest_1samp
+from scipy.stats import t as t_dist
 
 # Suppress ConvergenceWarning globally only for perm workers where it is expected;
 # elsewhere we count and log occurrences (see run_bootstrap).
@@ -134,6 +175,58 @@ def _get_task_labels(Y, config):
         return [str(c) for c in sorted(np.unique(Y))]
 
 
+def _is_multitask(config, Y):
+    """Return True if Y is a multi-output regression target.
+
+    Multi-task is defined as: regression mode AND Y is a 2-D array/DataFrame
+    with more than one column. Y is always a pandas Series or DataFrame from
+    load_and_prep_data, so no hasattr guard is required.
+    """
+    return (
+        config['analysis_type'] == 'regression'
+        and Y.ndim > 1
+        and Y.shape[1] > 1
+    )
+
+
+def _squeeze_binary_coef(c):
+    """Squeeze a (1, P) binary classification coef_ array to (P,).
+
+    Binary LogisticRegression returns coef_ with shape (1, P).
+    Multi-class returns (K, P) and must not be squeezed.
+    Regression single-output returns (P,) — unchanged.
+    Multi-task regression returns (K, P) — unchanged.
+    """
+    if c.ndim == 2 and c.shape[0] == 1:
+        return c.squeeze(axis=0)
+    return c
+
+
+def _strip_covariates(c, n_covs):
+    """Strip prepended covariate columns from a coefficient array.
+
+    When covariate_method='incorporate', covariate features are prepended to the
+    assembled feature matrix. The model's coef_ therefore includes n_covs leading
+    coefficients that must be removed before back-projection to brain feature space.
+
+    Parameters
+    ----------
+    c : ndarray, shape (P_total,) or (K, P_total)
+    n_covs : int
+        Number of covariate features prepended. 0 is a no-op.
+
+    Returns
+    -------
+    c_brain : ndarray
+        Coefficient array with covariate columns stripped.
+    """
+    if n_covs == 0:
+        return c
+    if c.ndim == 2:
+        return c[:, n_covs:]
+    return c[n_covs:]
+
+
 # --- Custom Transformer ---
 class CovariateScaler(BaseEstimator, TransformerMixin):
     """Scale covariate columns by 1/penalty_weight before entering the elastic net.
@@ -155,9 +248,11 @@ class CovariateScaler(BaseEstimator, TransformerMixin):
         self.penalty_weight = penalty_weight
 
     def fit(self, X, y=None, **params):
+        """No-op fit; transformer has no learnable parameters."""
         return self
 
     def transform(self, X):
+        """Scale covariate columns by 1/penalty_weight; return X unchanged if no-op."""
         if self.covariate_indices is None or self.penalty_weight == 1.0:
             return X
         if self.penalty_weight <= 0:
@@ -171,6 +266,66 @@ class CovariateScaler(BaseEstimator, TransformerMixin):
         else:
             X_transformed[:, self.covariate_indices] *= scale_factor
         return X_transformed
+
+
+class WeightTransformer(BaseEstimator, TransformerMixin):
+    """Scale X (and optionally Y) by sqrt(sample_weight) for multi-task weighted regression.
+
+    sklearn's MultiTaskElasticNet does not accept sample_weight in fit(). Multiplying
+    both X and Y by sqrt(w_i) is algebraically equivalent to weighted least squares in
+    the loss term:
+        sum_i w_i * ||y_i - X_i @ B||^2  ===  ||diag(sqrt(w)) @ (Y - X @ B)||^2_F
+
+    The L1+L2 penalty term is invariant to this transformation (appropriate — regularization
+    controls model complexity independently of observation representativeness). Alpha is
+    re-tuned on the transformed data by RandomizedSearchCV, compensating for scale change.
+
+    When is_multitask=False (or weights_ is None), all methods are no-ops: the transformer
+    acts as a pass-through for consistent pipeline step naming.
+
+    Parameters
+    ----------
+    is_multitask : bool
+        If True AND weights_ is set, apply sqrt(w) transformation.
+        If False, transform is a no-op regardless of weights_.
+    """
+    def __init__(self, is_multitask=False):
+        self.is_multitask = is_multitask
+        self.weights_ = None
+
+    def set_weights(self, w):
+        """Set sample weights for this transformer. w must be a 1-D non-negative array."""
+        w = np.asarray(w, dtype=float)
+        if np.any(w < 0):
+            raise ValueError("Sample weights must be non-negative; got negative values.")
+        self.weights_ = w
+        return self
+
+    def fit(self, X, y=None, **params):
+        """No-op fit; weights are set externally via set_weights()."""
+        return self
+
+    def transform(self, X):
+        """Scale X by sqrt(weights_) row-wise; no-op when is_multitask=False or weights_ is None."""
+        if not self.is_multitask or self.weights_ is None:
+            return X
+        sqrt_w = np.sqrt(self.weights_)
+        if isinstance(X, pd.DataFrame):
+            return X.multiply(sqrt_w, axis=0)
+        return X * sqrt_w[:, np.newaxis]
+
+    def transform_y(self, Y):
+        """Apply sqrt(w) scaling to the outcome matrix Y (called before fit, outside pipeline)."""
+        if not self.is_multitask or self.weights_ is None:
+            return Y
+        sqrt_w = np.sqrt(self.weights_)
+        if hasattr(Y, 'values'):
+            Y_arr = Y.values
+        else:
+            Y_arr = np.asarray(Y)
+        if Y_arr.ndim == 1:
+            return Y_arr * sqrt_w
+        return Y_arr * sqrt_w[:, np.newaxis]
 
 
 # --- Feature Reduction Transformers (applied fold-locally inside CV) ---
@@ -226,6 +381,7 @@ class _ClusterPCABase(BaseEstimator, TransformerMixin):
         self.loading_matrix_ = mat
 
     def transform(self, X):
+        """Apply per-cluster PCA; return DataFrame of cluster PC scores (or raw singleton values)."""
         from sklearn.utils.validation import check_is_fitted
         check_is_fitted(self, 'pcas_')
         if not self.pcas_:
@@ -241,6 +397,7 @@ class _ClusterPCABase(BaseEstimator, TransformerMixin):
         return pd.DataFrame(result, index=X_df.index if hasattr(X_df, 'index') else None)
 
     def get_feature_names_out(self):
+        """Return list of output feature names: cluster labels for multi-feature clusters, raw names for singletons."""
         result = []
         for cid, (feats, _, pca) in self.pcas_.items():
             result.append(self._cluster_label(cid) if pca is not None else feats[0])
@@ -274,6 +431,7 @@ class ClusterPCATransformer(_ClusterPCABase):
         return "Noise" if cid == -1 else f"Cluster_{cid}"
 
     def fit(self, X, y=None):
+        """Fit HDBSCAN clustering on training features, then fit per-cluster PCAs."""
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         if isinstance(X_df.columns[0], int):
             X_df.columns = self.feature_names_in_ if self.feature_names_in_ else list(range(X_df.shape[1]))
@@ -305,6 +463,7 @@ class AprioriTransformer(_ClusterPCABase):
         self.feature_names_in_ = None
 
     def fit(self, X, y=None):
+        """Fit per-cluster PCAs using the externally-defined apriori cluster map."""
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         self.feature_names_in_ = list(X_df.columns)
         cluster_map = pd.Series(
@@ -331,6 +490,7 @@ class ICATransformer(BaseEstimator, TransformerMixin):
         self.ic_names_ = None
 
     def fit(self, X, y=None):
+        """Fit StandardScaler and FastICA on training features; determine K via Parallel Analysis if auto."""
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         self.feature_names_in_ = list(X_df.columns)
         ica_cfg = self.config.get('ica_params', {})
@@ -364,6 +524,7 @@ class ICATransformer(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        """Standardize X and apply fitted ICA; return DataFrame of IC activation scores."""
         # feature_names_in_ set at fit time; DataFrame wrapping only when X arrives as ndarray
         X_df = pd.DataFrame(X, columns=self.feature_names_in_) if not isinstance(X, pd.DataFrame) else X
         X_std = self.scaler_.transform(X_df)
@@ -372,6 +533,7 @@ class ICATransformer(BaseEstimator, TransformerMixin):
                             index=X_df.index if hasattr(X_df, 'index') else None)
 
     def get_feature_names_out(self):
+        """Return list of IC names (IC_1, IC_2, ..., IC_K)."""
         return self.ic_names_
 
 
@@ -464,6 +626,33 @@ def load_and_prep_data(config, output_dir):
     subj_ids = df[data_cfg['subject_id_col']]
     weights_col = data_cfg.get("sample_weight_col")
     weights = df[weights_col] if weights_col else None
+
+    if weights is not None:
+        if (weights < 0).any():
+            raise ValueError(
+                "CRITICAL: sample_weight_col contains negative values. "
+                "All weights must be non-negative."
+            )
+        n_w = len(weights)
+        sum_w = weights.sum()
+        ess = (sum_w ** 2) / (weights ** 2).sum()
+        logging.info(
+            f"Sample weights: ESS={ess:.1f} / N={n_w} (ratio={ess/n_w:.3f}). "
+            f"Original sum={sum_w:.4f}."
+        )
+        if ess / n_w < 0.5:
+            logging.warning(
+                f"Sample weight ESS/N={ess/n_w:.3f} < 0.5: effective sample size is "
+                f"less than half the nominal N. Extreme weight heterogeneity may "
+                f"compromise regularization path stability and bootstrap coverage. "
+                f"Consider examining the weight distribution and trimming extreme "
+                f"values as a sensitivity analysis."
+            )
+        weights = weights * (n_w / sum_w)
+        logging.info(
+            f"Sample weights normalized to sum to N={n_w} "
+            f"(original sum={sum_w:.4f}; normalized sum={weights.sum():.4f})."
+        )
 
     # Covariates
     cov_method = config['covariate_method']
@@ -630,18 +819,6 @@ def _apply_reducer_fold(reducer_template, X_brain_tr, X_brain_te):
     return X_tr_red, X_te_red, r
 
 
-def _apply_reducer_full(reducer_template, X_brain):
-    """
-    Fit a reducer on the full brain feature set (for descriptive reporting only, not inference).
-    Returns fitted reducer.
-    """
-    if reducer_template is None:
-        return None
-    r = clone(reducer_template)
-    r.feature_names_in_ = list(X_brain.columns)
-    r.fit(X_brain)
-    return r
-
 
 def _backproject_coef_original_space(coef_reduced, reducer, original_feature_names):
     """Back-project reduced-space coefficients to original feature space.
@@ -726,10 +903,15 @@ SCORING_CLASSIFICATION = 'neg_log_loss'
 SCORING_REGRESSION_LOO = 'neg_mean_squared_error'
 
 
-def create_model_and_param_dist(config, all_feature_names, active_covariate_names, Y=None):
+def create_model_and_param_dist(config, all_feature_names, active_covariate_names, Y=None, weights=None):
     """
     Build sklearn Pipeline and RandomizedSearchCV param_dist.
     Covariates are always prepended; cov_indices = range(n_covariates).
+
+    When analysis_type is 'regression' AND Y is multi-output AND weights are provided,
+    a WeightTransformer step (is_multitask=True) is inserted between 'scaler' and
+    'cov_scaler'. For all other cases WeightTransformer is inserted as a no-op
+    (is_multitask=False) for consistent pipeline step naming.
     """
     mode = config['analysis_mode']
     model_cfg = config['model_params']
@@ -780,8 +962,17 @@ def create_model_and_param_dist(config, all_feature_names, active_covariate_name
         pw_max = model_cfg.get('covariate_penalty_weight_max', 1.0)
         param_dist['cov_scaler__penalty_weight'] = loguniform(pw_min, pw_max)
 
+    # Activate WeightTransformer only for multi-task regression with sample weights.
+    # For all other cases insert as a no-op (is_multitask=False) for consistent step naming.
+    is_mt = (
+        config['analysis_type'] == 'regression'
+        and Y is not None
+        and Y.ndim > 1 and Y.shape[1] > 1
+        and weights is not None
+    )
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
+        ('weight_transformer', WeightTransformer(is_multitask=is_mt)),
         ('cov_scaler', CovariateScaler(covariate_indices=cov_indices if cov_indices else None)),
         ('model', model)
     ])
@@ -950,8 +1141,22 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
     """Run nested cross-validation with fold-local feature reduction.
 
     Feature reduction is applied strictly inside the outer CV loop — fit on training
-    folds only — to prevent information leakage from test folds. Returns the CV
-    performance score (R² for regression, AUC-ROC for classification).
+    folds only — to prevent information leakage from test folds.
+
+    Returns
+    -------
+    score : float
+        CV performance score (R² for regression, AUC-ROC for classification).
+    fold_models : list of dict
+        Per-fold model records for ensemble inference. Each dict contains:
+        - fold_idx : int — global fold index (0-based)
+        - pipeline : fitted sklearn Pipeline
+        - reducer : fitted reducer (or None)
+        - best_params : dict — best hyperparameters from RandomizedSearchCV
+        - coef_original : ndarray — fold-specific coefficients in original brain feature space
+        - feat_std_map : pd.Series — StandardScaler scale_ indexed by all_feats
+        - all_feats : list of str — assembled feature names (covariates + reduced brain)
+        - n_covs : int — number of covariate features prepended
     """
     logging.info("--- Nested CV ---")
     outer = get_outer_cv(config)
@@ -960,8 +1165,19 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
     inner_scoring_adj = _adjust_scoring_for_loo(SCORING_REGRESSION if config['analysis_type'] == 'regression' else SCORING_CLASSIFICATION, inner)
     is_pre = config['covariate_method'] == 'pre_regress'
     reducer_template = _make_reducer(config, apriori_map)
+    original_feature_names = list(X_brain.columns)
+    P_brain = len(original_feature_names)
+
+    # Determine K (number of outer folds) for LOO vs. K-fold branching.
+    n_outer_cfg = config['cv_params']['n_outer_folds']
+    if isinstance(n_outer_cfg, str) and n_outer_cfg.lower() == 'loo':
+        K_outer = len(Y)  # LOO: K = N
+    else:
+        K_outer = int(n_outer_cfg)
 
     y_preds, y_probs, y_trues = [], [], []
+    fold_models = []
+
     # Use a 1-D array for CV splitting: KFold ignores Y values for regression;
     # for multi-task regression use first column; for multi-class use Y directly.
     split_Y = Y.iloc[:, 0] if hasattr(Y, 'ndim') and Y.ndim > 1 else Y
@@ -970,6 +1186,19 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
         X_brain_tr = X_brain.iloc[tr].reset_index(drop=True)
         X_brain_te = X_brain.iloc[te].reset_index(drop=True)
         X_brain_tr_red, X_brain_te_red, fold_reducer = _apply_reducer_fold(reducer_template, X_brain_tr, X_brain_te)
+
+        # Small-sample warning for selection frequency and bootstrap subsample viability
+        if fold_reducer is not None and hasattr(fold_reducer, 'get_feature_names_out'):
+            P_reduced = len(fold_reducer.get_feature_names_out())
+        else:
+            P_reduced = P_brain
+        half_n = len(tr) // 2
+        if half_n < max(3 * P_reduced, 30):
+            logging.warning(
+                f"Fold {fold_idx}: 50%% subsample size ({half_n}) is below the recommended "
+                f"minimum (max(3*P_reduced={3*P_reduced}, 30)={max(3*P_reduced, 30)}). "
+                f"Selection frequency and bootstrap CIs may be unreliable for this fold."
+            )
 
         # Save per-fold reducer outputs for transparency
         if fold_reducer is not None:
@@ -1002,8 +1231,10 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
             Y_tr, Y_te = _local_residualize(X_cov, Y, tr, te)
 
         all_feats = list(X_tr.columns)
+        n_covs = len(active_covs) if config['covariate_method'] != 'pre_regress' else 0
         pipeline, param_dist, scoring, metric = create_model_and_param_dist(
-            config, all_feats, active_covs if config['covariate_method'] != 'pre_regress' else [], Y=Y
+            config, all_feats, active_covs if config['covariate_method'] != 'pre_regress' else [],
+            Y=Y, weights=weights
         )
 
         search = RandomizedSearchCV(
@@ -1015,15 +1246,68 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
             refit=True,
             random_state=42
         )
+
+        # WeightTransformer (multi-task regression + weights): set weights before fit,
+        # transform Y before passing to search (Y never enters StandardScaler in pipeline).
+        is_mt = _is_multitask(config, Y)
+        Y_tr_fit = Y_tr.values if hasattr(Y_tr, 'values') else Y_tr
+
         fit_params = {}
-        if weights is not None and not isinstance(pipeline.named_steps['model'], MultiTaskElasticNet):
+        if weights is not None and not is_mt:
             fit_params['model__sample_weight'] = weights.iloc[tr].values
-        search.fit(X_tr, Y_tr.values if hasattr(Y_tr, 'values') else Y_tr, **fit_params)
+
+        if is_mt and weights is not None:
+            wt = search.estimator.named_steps['weight_transformer']
+            wt.set_weights(weights.iloc[tr].values)
+            Y_tr_fit = wt.transform_y(Y_tr_fit)
+
+        search.fit(X_tr, Y_tr_fit, **fit_params)
 
         y_preds.append(search.predict(X_te))
         y_trues.append(Y_te.values if hasattr(Y_te, 'values') else Y_te)
         if config['analysis_type'] == 'classification':
             y_probs.append(search.predict_proba(X_te))
+
+        # Extract fold-specific coefficients and back-project to original brain feature space.
+        # For multi-task + weights: search.best_estimator_.weight_transformer.weights_ is None
+        # because sklearn's clone() (called by RandomizedSearchCV for each parameter combination
+        # and for the refit step) preserves only __init__ parameters, dropping weights_ which is
+        # set via set_weights(). Construct a correctly-weighted fold model by re-fitting a fresh
+        # pipeline with best_params and correct weights. Note: hyperparameter selection used
+        # unweighted data in the inner CV; the refit here produces correct fold-model
+        # coefficients with the intended weight transformation.
+        if is_mt and weights is not None:
+            best_pipe = clone(search.estimator)
+            best_pipe.set_params(**search.best_params_)
+            wt_refit = best_pipe.named_steps['weight_transformer']
+            wt_refit.set_weights(weights.iloc[tr].values)
+            Y_tr_refit = wt_refit.transform_y(
+                Y_tr.values if hasattr(Y_tr, 'values') else Y_tr
+            )
+            best_pipe.fit(X_tr, Y_tr_refit)
+            best_estimator = best_pipe
+        else:
+            best_estimator = search.best_estimator_
+        c = _squeeze_binary_coef(best_estimator.named_steps['model'].coef_)
+        # Split off covariate part before back-projection. Covariates are always prepended
+        # when covariate_method='incorporate'; they must be stripped regardless of whether
+        # a reducer is active (when reducer is None, _backproject_coef_original_space is a
+        # no-op so stripping here is the only mechanism that removes them).
+        c_brain = _strip_covariates(c, n_covs)
+        coef_original = _backproject_coef_original_space(c_brain, fold_reducer, original_feature_names)
+
+        feat_std_map = pd.Series(best_estimator.named_steps['scaler'].scale_, index=all_feats)
+
+        fold_models.append({
+            'fold_idx': fold_idx,
+            'pipeline': best_estimator,
+            'reducer': fold_reducer,
+            'best_params': search.best_params_,
+            'coef_original': coef_original,
+            'feat_std_map': feat_std_map,
+            'all_feats': all_feats,
+            'n_covs': n_covs,
+        })
 
     Y_true = np.concatenate(y_trues)
     Y_pred = np.concatenate(y_preds)
@@ -1052,10 +1336,161 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
     except Exception as exc:
         logging.warning(f"_compute_evaluation_metrics failed (non-fatal): {exc}")
 
-    return score
+    return score, fold_models
 
 
-# --- Step 5: Permutation ---
+# --- Step 5: Tier 1 Inference (fold-wise ensemble) ---
+
+def _write_fold_diagnostics(fold_models, out_dir):
+    """Write per-fold hyperparameter diagnostics and summary statistics.
+
+    Outputs
+    -------
+    report_fold_diagnostics.csv : per-fold alpha_or_C, l1_ratio, penalty_weight
+    report_fold_params_summary.csv : mean ± SD, min, max across all K folds
+    """
+    rows = []
+    for fm in fold_models:
+        bp = fm['best_params']
+        rows.append({
+            'fold_idx': fm['fold_idx'],
+            'alpha_or_C': bp.get('model__alpha', bp.get('model__C', np.nan)),
+            'l1_ratio': bp.get('model__l1_ratio', np.nan),
+            'penalty_weight': bp.get('cov_scaler__penalty_weight', np.nan),
+        })
+    diag_df = pd.DataFrame(rows)
+    diag_df.to_csv(os.path.join(out_dir, 'report_fold_diagnostics.csv'), index=False)
+
+    # Summary statistics across all folds
+    summary_rows = []
+    for col in ['alpha_or_C', 'l1_ratio', 'penalty_weight']:
+        vals = diag_df[col].dropna()
+        if len(vals) == 0:
+            continue
+        summary_rows.append({
+            'param': col,
+            'mean': float(vals.mean()),
+            'sd': float(vals.std(ddof=1)) if len(vals) > 1 else float('nan'),
+            'min': float(vals.min()),
+            'max': float(vals.max()),
+            'n_folds': len(vals),
+        })
+    pd.DataFrame(summary_rows).to_csv(
+        os.path.join(out_dir, 'report_fold_params_summary.csv'), index=False
+    )
+
+
+def _write_tier1_report(coef_matrix, feature_names, out_dir, ci_level):
+    """Compute and write Tier 1 inference: one-sample t-test across K fold coefficients.
+
+    Parameters
+    ----------
+    coef_matrix : ndarray, shape (K, P)
+        Fold-specific coefficients in original brain feature space.
+    feature_names : list of str, length P
+        Original brain feature names.
+    out_dir : str
+        Output directory.
+    ci_level : float
+        Confidence level (e.g. 0.95).
+
+    Outputs
+    -------
+    report_fold_ensemble_importance.csv
+        fold_mean_coef, fold_sd_coef, fold_cv_coef, t_statistic, p_value_t,
+        ci_low_t, ci_high_t, is_significant, is_significant_fdr
+    """
+    KR, P = coef_matrix.shape
+    fold_mean = coef_matrix.mean(axis=0)
+    fold_sd = coef_matrix.std(axis=0, ddof=1)
+    # Coefficient of variation (unsigned): |SD / mean|; guard against division by zero
+    fold_cv = np.where(np.abs(fold_mean) > 1e-30, np.abs(fold_sd / fold_mean), np.nan)
+
+    t_stat, p_val = ttest_1samp(coef_matrix, popmean=0, axis=0)
+
+    # t-based CI (two-sided)
+    alpha_t = 1.0 - ci_level
+    dof = KR - 1
+    se = fold_sd / np.sqrt(KR)
+    t_crit = t_dist.ppf(1.0 - alpha_t / 2, dof)
+    ci_low = fold_mean - t_crit * se
+    ci_high = fold_mean + t_crit * se
+
+    is_sig = (ci_low > 0) | (ci_high < 0)
+    is_sig_fdr = _bh_fdr(p_val, q=0.05)
+
+    df_out = pd.DataFrame({
+        'feature': feature_names,
+        'fold_mean_coef': fold_mean,
+        'fold_sd_coef': fold_sd,
+        'fold_cv_coef': fold_cv,
+        't_statistic': t_stat,
+        'p_value_t': p_val,
+        'ci_low_t': ci_low,
+        'ci_high_t': ci_high,
+        'is_significant': is_sig,
+        'is_significant_fdr': is_sig_fdr,
+    })
+    df_out.to_csv(os.path.join(out_dir, 'report_fold_ensemble_importance.csv'), index=False)
+
+
+def run_tier1_inference(config, fold_models, X_brain, Y, active_covs):
+    """Run Tier 1 inference: one-sample t-test across K fold-specific coefficient vectors.
+
+    For each feature, tests H0: mean fold coefficient = 0 using a one-sample t-test
+    across the K fold-specific coefficient vectors. This captures both sampling variance
+    and hyperparameter tuning variance (different best_params per fold).
+
+    Design intent: Tier 1 is a liberal screen. Within-fold training set overlap
+    (~(K-1)/K) induces positive correlation between fold coefficient estimates,
+    underestimating SE and producing anti-conservative CIs (Bengio & Grandvalet, 2004).
+    This is intentional — the anti-conservative bias ensures Tier 1 casts a wider net
+    than Tier 2. Tier 2 bootstrap CIs are conservative due to L1 zero-inflation.
+    Features significant in both tiers are high-confidence; features significant only
+    in Tier 1 are candidates warranting further investigation (see STATISTICAL NOTES).
+
+    Outputs
+    -------
+    report_fold_ensemble_importance.csv (or task_{lbl}/report_fold_ensemble_importance.csv)
+    report_fold_diagnostics.csv
+    report_fold_params_summary.csv
+    """
+    logging.info("--- Tier 1 Inference (fold-wise ensemble t-test) ---")
+    out_dir = config['paths']['output_dir']
+    ci_level = config['stats_params']['ci_level']
+    original_feature_names = list(X_brain.columns)
+
+    logging.info(
+        "Tier 1 design: liberal screen (anti-conservative by design). "
+        "Within-fold overlap underestimates SE (Bengio & Grandvalet, 2004). "
+        "Interpret through concordance with Tier 2 bootstrap CIs. "
+        "Features significant in both tiers: high-confidence. "
+        "Features significant only in Tier 1: candidates for further investigation."
+    )
+
+    # Determine if multi-output from the first fold's coef_original
+    sample_coef = fold_models[0]['coef_original']
+    is_multi = sample_coef.ndim == 2  # (K_tasks, P)
+
+    if not is_multi:
+        # Single-output: stack (K, P)
+        coef_matrix = np.stack([fm['coef_original'] for fm in fold_models], axis=0)
+        _write_tier1_report(coef_matrix, original_feature_names, out_dir, ci_level)
+    else:
+        # Multi-output: coef_original is (K_tasks, P); stack to (K, K_tasks, P)
+        coef_array = np.stack([fm['coef_original'] for fm in fold_models], axis=0)
+        task_labels = _get_task_labels(Y, config)
+        for k, lbl in enumerate(task_labels):
+            out_dir_k = os.path.join(out_dir, f'task_{lbl}')
+            os.makedirs(out_dir_k, exist_ok=True)
+            coef_matrix_k = coef_array[:, k, :]  # (K, P)
+            _write_tier1_report(coef_matrix_k, original_feature_names, out_dir_k, ci_level)
+
+    _write_fold_diagnostics(fold_models, out_dir)
+    logging.info("Tier 1 inference complete.")
+
+
+# --- Step 6: Permutation ---
 def _run_cv_fold_loop(X_brain, Y, X_cov, active_covs, config, seed, apriori_map=None):
     """Run full nested CV fold loop and return R²/AUC on concatenated outer-fold predictions.
 
@@ -1172,105 +1607,77 @@ def run_permutation_test(config, X_brain, Y, weights, X_cov, active_covs, actual
         )
 
 
-# --- Step 6: Selection Frequency ---
-def _fit_full_data_model(config, X_brain, Y, weights, X_cov, active_covs, apriori_map):
+# --- Step 7: Selection Frequency ---
+
+def _get_n_fold_bootstraps(config):
+    """Return the per-fold bootstrap budget from config.
+
+    Reads n_fold_bootstraps (preferred). Falls back to n_bootstraps (deprecated)
+    with a warning. Defaults to 500 if neither is present.
     """
-    Shared setup for descriptive stages (selection frequency, bootstrap):
-    fit reducer on full data, assemble X_full, tune hyperparameters, return fitted model.
-
-    Note: reducer is fit on full data (not cross-validated) because these stages are
-    descriptive — see run_nested_cv for the inferential (fold-local) pathway.
-    """
-    is_pre = config['covariate_method'] == 'pre_regress'
-    n_iter = config['cv_params']['n_random_search_iter']
-
-    reducer_template = _make_reducer(config, apriori_map)
-    reducer_full = _apply_reducer_full(reducer_template, X_brain)
-    # Feature reduction is fit on the full dataset here because this is a descriptive
-    # stage. Inferential validity is preserved in run_nested_cv where reduction is
-    # strictly fold-local (fit on training data only).
-    if reducer_full is not None:
-        logging.info(
-            "Descriptive stage: feature reducer fit on full dataset (not fold-local). "
-            "See run_nested_cv for the inferential (fold-local) pathway."
-        )
-    X_brain_red = reducer_full.transform(X_brain) if reducer_full is not None else X_brain
-
-    if not X_cov.empty and not is_pre:
-        X_full = pd.concat(
-            [X_cov.reset_index(drop=True), X_brain_red.reset_index(drop=True)], axis=1
-        )
-    else:
-        X_full = X_brain_red.reset_index(drop=True)
-
-    all_feats = list(X_full.columns)
-    pipeline, param_dist, scoring, _ = create_model_and_param_dist(
-        config, all_feats, active_covs if not is_pre else [], Y=Y
-    )
-
-    fit_Y = Y.reset_index(drop=True) if hasattr(Y, 'reset_index') else pd.Series(Y)
-    if is_pre and not X_cov.empty:
+    stats = config.get('stats_params', {})
+    if 'n_fold_bootstraps' in stats:
+        return int(stats['n_fold_bootstraps'])
+    if 'n_bootstraps' in stats:
         logging.warning(
-            "pre_regress: hyperparameter tuning uses full-sample residuals. "
-            "This is a minor approximation; individual iteration estimates are unaffected."
+            "config.stats_params.n_bootstraps is deprecated. "
+            "Please rename to n_fold_bootstraps (semantics: per-fold budget; "
+            "total iterations = K x n_fold_bootstraps)."
         )
-        lr = LinearRegression().fit(X_cov, Y)
-        fit_Y = pd.Series(Y.values - lr.predict(X_cov), name=Y.name if hasattr(Y, 'name') else 'Y')
-
-    fit_params = {}
-    if weights is not None and not isinstance(pipeline.named_steps['model'], MultiTaskElasticNet):
-        fit_params['model__sample_weight'] = weights.values
-
-    search = RandomizedSearchCV(
-        pipeline, param_dist, scoring=scoring, n_jobs=config['n_cores'],
-        n_iter=n_iter, cv=get_inner_cv(config), refit=True, random_state=42
-    )
-    search.fit(X_full, fit_Y.values, **fit_params)
-    best_model = search.best_estimator_
-    feat_std_map = pd.Series(best_model.named_steps['scaler'].scale_, index=all_feats)
-    best_params = search.best_params_
-
-    return X_full, best_model, reducer_full, feat_std_map, fit_Y, fit_params, best_params
+        return int(stats['n_bootstraps'])
+    logging.warning("Neither n_fold_bootstraps nor n_bootstraps found in config; defaulting to 500.")
+    return 500
 
 
-def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=None):
-    """Bootstrap selection frequency: a descriptive measure of feature inclusion robustness.
+
+def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, fold_models, apriori_map=None):
+    """Fold-wise bootstrap selection frequency: a descriptive measure of feature inclusion robustness.
 
     Per-iteration re-reduction: each subsample iteration fits a fresh reducer clone on
-    the subsampled brain features, fits the model in reduced space with fixed
-    hyperparameters (tuned on full data), back-projects selection indicators to the
-    invariant original feature space using _backproject_coef_original_space.
+    the subsampled brain features, fits the model in reduced space with fold-specific
+    best_params (from each fold's RandomizedSearchCV), back-projects selection indicators
+    to the invariant original feature space using _backproject_coef_original_space.
+
+    Selection iterations are distributed evenly across all K folds (each fold gets
+    max(n_fold_bootstraps, 50) iterations). This spreads sampling and tuning variance
+    across all folds rather than concentrating it in a single model.
+    Ensemble selection probability is the mean across all K fold-level indicators.
 
     Aggregation of selection indicators in original feature space is meaningful across
-    iterations with different reducer fits. No significance threshold is applied;
-    selection frequency is purely descriptive.
+    iterations with different reducer fits (Meinshausen & Bühlmann, 2010, JRSS-B).
+    No significance threshold is applied; selection frequency is purely descriptive.
     """
-    logging.info('--- Selection Frequency (descriptive) ---')
-    n_iter = config['stats_params']['n_bootstraps']
+    logging.info('--- Selection Frequency (fold-wise, descriptive) ---')
+    n_fold_bootstraps = _get_n_fold_bootstraps(config)
     n_cores = config['n_cores']
     is_pre = config['covariate_method'] == 'pre_regress'
     original_feature_names = list(X_brain.columns)
-
-    X_full, best_model, _, _, _, fit_params, best_params = _fit_full_data_model(
-        config, X_brain, Y, weights, X_cov, active_covs, apriori_map
-    )
-    full_feat_names = list(X_full.columns)
-    reducer_template = _make_reducer(config, apriori_map)
-
-    # Determine output feature names: same logic as run_bootstrap
     red_method = config['feature_reduction_method']
-    out_feat_names = full_feat_names if red_method == 'none' else original_feature_names
+    out_feat_names = original_feature_names  # always report in original feature space
 
-    def subsample_task(seed):
+    n_per_fold_repeat = max(n_fold_bootstraps, 50)
+    logging.info(
+        f"Selection frequency: {len(fold_models)} folds x {n_per_fold_repeat} iterations/fold = "
+        f"{len(fold_models) * n_per_fold_repeat} total subsample iterations."
+    )
+
+    rng_master = np.random.RandomState(43)
+
+    def _subsample_iter(fm, seed):
+        """Single 50% subsample iteration using fold-specific best_params."""
         rng_sub = np.random.RandomState(seed)
         idx = rng_sub.choice(len(Y), len(Y) // 2, replace=False)
 
+        # Use fold-specific reducer template (clone from fitted reducer or from factory)
+        if fm['reducer'] is not None:
+            reducer_sub = clone(fm['reducer'])
+            reducer_sub.feature_names_in_ = original_feature_names
+        else:
+            reducer_sub = None
+
         # Resample brain features, fit fresh reducer clone (per-iteration re-reduction)
         X_brain_sub = X_brain.iloc[idx].reset_index(drop=True)
-        reducer_sub = None
-        if reducer_template is not None:
-            reducer_sub = clone(reducer_template)
-            reducer_sub.feature_names_in_ = original_feature_names
+        if reducer_sub is not None:
             reducer_sub.fit(X_brain_sub)
             X_brain_sub_red = reducer_sub.transform(X_brain_sub)
         else:
@@ -1283,7 +1690,7 @@ def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apr
         else:
             X_sub = X_brain_sub_red
 
-        Y_arr = Y.values if hasattr(Y, 'values') else np.array(Y)
+        Y_arr = Y.values
         Y_sub = Y_arr[idx]
         if is_pre and not X_cov.empty:
             X_cov_sub_pr = X_cov.iloc[idx].reset_index(drop=True)
@@ -1291,58 +1698,67 @@ def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apr
             Y_sub = Y_sub - lr_sub.predict(X_cov_sub_pr)
 
         all_feats_sub = list(X_sub.columns)
+        is_mt = _is_multitask(config, Y)
         m, _, _, _ = create_model_and_param_dist(
             config, all_feats_sub,
             active_covs if not is_pre else [],
-            Y=Y
+            Y=Y, weights=weights if is_mt else None
         )
-        m.set_params(**best_params)
+        m.set_params(**fm['best_params'])
 
-        if weights is not None and not isinstance(m.named_steps['model'], MultiTaskElasticNet):
-            m.fit(X_sub, Y_sub, model__sample_weight=weights.values[idx])
-        else:
-            m.fit(X_sub, Y_sub)
-
-        c = m.named_steps['model'].coef_
-        # Binary classification: coef_ is (1, P) — squeeze to (P,) for single-output path.
-        # Multi-class (K>=2): coef_ is (K, P) — preserve for per-class reporting.
-        if c.ndim == 2 and c.shape[0] == 1:
-            c = c.squeeze(axis=0)
-        c_reduced = c  # shape (P,) or (K, P)
-
-        # Split covariate and brain coefficients when incorporate + reduction is active
         n_covs_sub = len(active_covs) if not is_pre else 0
-        if reducer_sub is not None and n_covs_sub > 0:
-            if c_reduced.ndim == 2:
-                c_brain_reduced = c_reduced[:, n_covs_sub:]
-            else:
-                c_brain_reduced = c_reduced[n_covs_sub:]
-            c_orig = _backproject_coef_original_space(c_brain_reduced, reducer_sub, original_feature_names)
-        else:
-            c_orig = _backproject_coef_original_space(c_reduced, reducer_sub, original_feature_names)
+        if is_mt and weights is not None:
+            wt = m.named_steps['weight_transformer']
+            wt.set_weights(weights.values[idx])
+            Y_sub = wt.transform_y(Y_sub)
+        elif weights is not None and not isinstance(m.named_steps['model'], MultiTaskElasticNet):
+            m.fit(X_sub, Y_sub, model__sample_weight=weights.values[idx])
+            c = _squeeze_binary_coef(m.named_steps['model'].coef_)
+            c_brain = _strip_covariates(c, n_covs_sub)
+            c_orig = _backproject_coef_original_space(c_brain, reducer_sub, original_feature_names)
+            return (c_orig != 0).astype(int)
+
+        m.fit(X_sub, Y_sub)
+
+        c = _squeeze_binary_coef(m.named_steps['model'].coef_)
+        c_brain = _strip_covariates(c, n_covs_sub)
+        c_orig = _backproject_coef_original_space(c_brain, reducer_sub, original_feature_names)
         return (c_orig != 0).astype(int)
 
-    results = Parallel(n_jobs=n_cores)(
-        delayed(subsample_task)(s) for s in np.random.RandomState(43).randint(0, int(1e9), n_iter)
+    # Pre-generate all (fold_model, seed) tasks in fold-sequential order to preserve
+    # reproducibility. A single flat Parallel dispatch reduces joblib pool creation
+    # from K launches to 1, yielding ~5-15% wall-time reduction for typical configs.
+    task_list = [
+        (fm, s)
+        for fm in fold_models
+        for s in rng_master.randint(0, int(1e9), n_per_fold_repeat)
+    ]
+    flat_results = Parallel(n_jobs=n_cores)(
+        delayed(_subsample_iter)(fm, s) for fm, s in task_list
     )
+    all_results = [r for r in flat_results if r is not None]
+
+    if not all_results:
+        logging.warning("Selection frequency: all iterations failed. Skipping output.")
+        return
 
     # Detect multi-output (each result is either (P,) or (K, P))
-    sample_res = results[0]
+    sample_res = all_results[0]
     is_multi = sample_res.ndim == 2  # True for multi-task regression or multi-class classification
+    out_dir = config['paths']['output_dir']
 
     if not is_multi:
-        # Single-output: results is a list of (P,) arrays
+        # Single-output: results is a list of (P,) arrays; ensemble mean = selection probability
         pd.DataFrame({
             'feature': out_feat_names,
-            'selection_probability': np.mean(results, axis=0)
+            'selection_probability': np.mean(all_results, axis=0)
         }).to_csv(
-            os.path.join(config['paths']['output_dir'], 'report_selection_frequency.csv'), index=False
+            os.path.join(out_dir, 'report_selection_frequency.csv'), index=False
         )
     else:
         # Multi-output: stack to (n_iter, K, P), write per-task files + union aggregate
-        sel_array = np.stack(results, axis=0)  # (n_iter, K, P)
+        sel_array = np.stack(all_results, axis=0)  # (n_iter, K, P)
         task_labels = _get_task_labels(Y, config)
-        out_dir = config['paths']['output_dir']
         for k, lbl in enumerate(task_labels):
             out_dir_k = os.path.join(out_dir, f'task_{lbl}')
             os.makedirs(out_dir_k, exist_ok=True)
@@ -1358,7 +1774,7 @@ def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apr
         }).to_csv(os.path.join(out_dir, 'report_selection_frequency.csv'), index=False)
 
 
-# --- Step 7: Bootstrap & Reporting ---
+# --- Step 8: Bootstrap & Reporting ---
 def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
                apriori_map=None, X_cov=None, active_covs=None):
     """Single bootstrap iteration (per-iteration re-reduction + back-projection).
@@ -1399,7 +1815,10 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
     Returns
     -------
     (coef_original, converged) : tuple
-        coef_original : ndarray, shape (P,) — coefficients in original feature space.
+        coef_original : ndarray, shape (P,) or (K_tasks, P) — coefficients in original
+            brain feature space. Single-output regression and binary classification
+            return shape (P,); multi-task regression and multi-class classification
+            return shape (K, P) where K is the number of tasks or classes.
         converged : bool — False if ConvergenceWarning was raised.
     None on failure.
     """
@@ -1435,7 +1854,7 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
             X_boot = X_brain_boot_red
 
         # Outcome: residualize for pre_regress
-        Y_arr = Y.values if hasattr(Y, 'values') else np.array(Y)
+        Y_arr = Y.values
         Y_boot = Y_arr[idx]
         if is_pre and X_cov is not None and not X_cov.empty:
             X_cov_boot_pr = X_cov.iloc[idx].reset_index(drop=True)
@@ -1445,48 +1864,51 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
         # Build pipeline from best_params (no re-tuning)
         all_feats_boot = list(X_boot.columns)
         n_covs_boot = len(active_covs) if not is_pre else 0
+        is_mt = _is_multitask(config, Y)
 
         pipeline_boot, _, _, _ = create_model_and_param_dist(
             config, all_feats_boot,
             active_covs if not is_pre else [],
-            Y=Y if not hasattr(Y, 'values') else (pd.DataFrame(Y_boot, columns=Y.columns) if Y.ndim > 1 else pd.Series(Y_boot))
+            Y=Y if not hasattr(Y, 'values') else (pd.DataFrame(Y_boot, columns=Y.columns) if Y.ndim > 1 else pd.Series(Y_boot)),
+            weights=weights if is_mt else None
         )
         # Set best hyperparameters directly (no RandomizedSearchCV)
         pipeline_boot.set_params(**best_params)
 
+        # WeightTransformer: set weights and transform Y for multi-task + weights case
+        Y_fit = Y_boot
+        if is_mt and weights is not None:
+            wt = pipeline_boot.named_steps['weight_transformer']
+            wt.set_weights(weights.values[idx])
+            Y_fit = wt.transform_y(Y_boot)
+
         converged = True
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ConvergenceWarning)
-            if weights is not None and not isinstance(pipeline_boot.named_steps['model'], MultiTaskElasticNet):
-                pipeline_boot.fit(X_boot, Y_boot,
+            if weights is not None and not is_mt:
+                pipeline_boot.fit(X_boot, Y_fit,
                                   model__sample_weight=weights.values[idx])
             else:
-                pipeline_boot.fit(X_boot, Y_boot)
+                pipeline_boot.fit(X_boot, Y_fit)
         if any(issubclass(w.category, ConvergenceWarning) for w in caught):
             converged = False
 
-        c = pipeline_boot.named_steps['model'].coef_
         # Binary classification: coef_ is (1, P) — squeeze to (P,) for single-output path.
         # Multi-class (K>=2): coef_ is (K, P) — preserve for per-class reporting.
         # Regression single-output: coef_ is (P,) — unchanged.
         # Multi-task regression: coef_ is (K, P) — preserved.
-        if c.ndim == 2 and c.shape[0] == 1:
-            c = c.squeeze(axis=0)
-        c_reduced = c  # shape (P,) or (K, P)
+        c = _squeeze_binary_coef(pipeline_boot.named_steps['model'].coef_)
 
         # Back-project to original feature space.
-        # When covariates are incorporated AND reduction is active, the model's coef_
-        # has shape (n_covs + n_brain_reduced,) for single-output, or
-        # (K, n_covs + n_brain_reduced) for multi-output. The loading/mixing matrix only
-        # covers brain features, so split off the covariate columns before back-projecting.
-        if reducer_boot is not None and n_covs_boot > 0:
-            if c_reduced.ndim == 2:
-                c_brain_reduced = c_reduced[:, n_covs_boot:]
-            else:
-                c_brain_reduced = c_reduced[n_covs_boot:]
-            c_original = _backproject_coef_original_space(c_brain_reduced, reducer_boot, original_feature_names)
-        else:
-            c_original = _backproject_coef_original_space(c_reduced, reducer_boot, original_feature_names)
+        # When covariates are incorporated (covariate_method='incorporate'), covariate
+        # columns are prepended to the model's coef_ regardless of whether a reducer is
+        # active. Strip them unconditionally before back-projection; when reducer is None
+        # _backproject_coef_original_space is a no-op, so stripping here is the only
+        # mechanism that removes covariate coefficients from the reported brain-feature
+        # coefficient vector.
+        c_original = _backproject_coef_original_space(
+            _strip_covariates(c, n_covs_boot), reducer_boot, original_feature_names
+        )
 
         return c_original, converged
     except Exception as exc:
@@ -1527,7 +1949,7 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     """
     analysis_type = config['analysis_type']
     out_dir = config['paths']['output_dir']
-    mask = report_df['is_significant'] == True
+    mask = report_df['is_significant']
     candidates = report_df[mask]
     if candidates.empty:
         return
@@ -1543,7 +1965,12 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     feat_col = 'component_id' if 'component_id' in report_df.columns else (
         'cluster_id' if 'cluster_id' in report_df.columns else 'feature'
     )
-    assert Y.ndim == 1, f"calculate_visualization_data expects 1-D Y, got shape {Y.shape}"
+    if Y.ndim > 1:
+        logging.info(
+            "calculate_visualization_data: skipped for multi-output Y "
+            f"(shape {Y.shape}); visualization is single-output only."
+        )
+        return
     plot_data = []
     Y_arr = Y.values if hasattr(Y, 'values') else Y
     subject_ids_arr = subject_ids.values if hasattr(subject_ids, 'values') else subject_ids
@@ -1606,18 +2033,18 @@ def _add_fdr_columns(df, pd_col='pd'):
 
 
 
-def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_model):
+def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config):
     """
     Compute shared statistics for all reduction methods: std/raw means, CIs, pd, is_significant.
-    Accounts for CovariateScaler penalty_weight in raw coefficient conversion.
 
     Notes
     -----
     With per-iteration re-reduction (conditional bootstrap, Efron & Tibshirani, 1993,
-    Ch. 13), df_coef is always in the original brain feature space. When
-    feature_reduction_method != 'none', df_coef contains only brain features (no
-    covariates), so the covariate penalty-weight adjustment is only applied when the
-    df_coef columns match the full model feature set (i.e., feature_reduction_method == 'none').
+    Ch. 13), df_coef reaching this function is always brain-only: covariate coefficients
+    are stripped upstream in run_nested_cv (coef_original), _boot_task (bootstrap
+    coefficients), and _subsample_iter (selection-frequency indicators). No penalty-weight
+    adjustment is therefore applied here; raw coefficients are recovered by dividing
+    standardised coefficients by the aligned feature standard deviations directly.
     """
     out_dir = config['paths']['output_dir']
     alpha = 1.0 - config['stats_params']['ci_level']
@@ -1628,18 +2055,9 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_
     # Align feat_std_map to df_coef columns (may differ after per-iteration back-projection)
     feat_std_map_aligned = feat_std_map.reindex(df_coef.columns).fillna(1.0)
 
-    pw = best_model.named_steps['cov_scaler'].penalty_weight
-    cov_idx = best_model.named_steps['cov_scaler'].covariate_indices
-    feat_std_map_adj = feat_std_map_aligned.copy()
-    # Only adjust covariate indices when df_coef actually contains the full model feature set
-    # (i.e., no reduction was applied, so covariates appear in df_coef columns)
-    red_method = config['feature_reduction_method']
-    if cov_idx and pw != 1.0 and red_method == 'none':
-        feat_std_map_adj.iloc[cov_idx] = feat_std_map_adj.iloc[cov_idx] / pw
-
-    raw_means = np.divide(std_means, feat_std_map_adj, out=np.zeros_like(std_means), where=feat_std_map_adj != 0)
-    raw_ci_low = np.divide(std_ci_low, feat_std_map_adj, out=np.zeros_like(std_ci_low), where=feat_std_map_adj != 0)
-    raw_ci_high = np.divide(std_ci_high, feat_std_map_adj, out=np.zeros_like(std_ci_high), where=feat_std_map_adj != 0)
+    raw_means = np.divide(std_means, feat_std_map_aligned, out=np.zeros_like(std_means), where=feat_std_map_aligned != 0)
+    raw_ci_low = np.divide(std_ci_low, feat_std_map_aligned, out=np.zeros_like(std_ci_low), where=feat_std_map_aligned != 0)
+    raw_ci_high = np.divide(std_ci_high, feat_std_map_aligned, out=np.zeros_like(std_ci_high), where=feat_std_map_aligned != 0)
 
     is_sig = (std_ci_low > 0) | (std_ci_high < 0)
     pd_val = pd.concat([(df_coef > 0).mean(), (df_coef < 0).mean()], axis=1).max(axis=1)
@@ -1700,37 +2118,23 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
         logging.debug("Back-projection traceback:", exc_info=True)
 
 
-def _report_cluster_pca(df_coef, all_feats, stats, config, active_covs,
-                        reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """Cluster PCA: individual feature report in original feature space (per-iteration re-reduction).
+def _report_standard(df_coef, all_feats, stats, config, active_covs,
+                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
+    """Standard importance report for none, cluster_pca, and ica reduction methods.
 
-    With per-iteration re-reduction, df_coef is already in original brain feature space after
-    back-projection in each bootstrap iteration. Report feature-level statistics directly.
+    Writes report_feature_importance.csv (none) or report_individual_importance.csv
+    (cluster_pca, ica) and calls calculate_visualization_data. For ica, also saves
+    the full-data mixing matrix for transparency. For cluster_pca, renames 'feature'
+    to 'cluster_id' in the visualization call to match the expected column name.
+
+    With per-iteration re-reduction, df_coef is already in original brain feature space
+    after back-projection in each bootstrap iteration — report directly.
     """
     out_dir = stats['out_dir']
-    indiv_df = _build_individual_report_df(all_feats, stats)
-    indiv_df.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
-    calculate_visualization_data(
-        config, X_full, Y, weights, subject_ids, best_model,
-        indiv_df.rename(columns={'feature': 'cluster_id'}), 'individual', X_brain
-    )
+    red_method = config['feature_reduction_method']
 
-
-def _report_ica(df_coef, all_feats, stats, config, active_covs,
-                reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """ICA: individual feature report in original feature space (per-iteration re-reduction).
-
-    With per-iteration re-reduction, each bootstrap iteration back-projects IC-space coefficients
-    to original brain feature space using the activation pattern (Haufe et al., 2014):
-       feature_coef = A @ beta_IC  (A = mixing_unnorm_, shape P x K_ic)
-    df_coef is therefore already in original brain feature space — report directly.
-
-    The full-data ICA mixing matrix is saved for transparency (descriptive).
-    """
-    out_dir = stats['out_dir']
-
-    # Save full-data mixing matrix for transparency
-    if reducer_full is not None and hasattr(reducer_full, 'mixing_unnorm_'):
+    # Save ICA full-data mixing matrix for transparency
+    if red_method == 'ica' and reducer_full is not None and hasattr(reducer_full, 'mixing_unnorm_'):
         mixing_df = pd.DataFrame(
             reducer_full.mixing_unnorm_,
             index=reducer_full.feature_names_in_,
@@ -1738,79 +2142,168 @@ def _report_ica(df_coef, all_feats, stats, config, active_covs,
         )
         mixing_df.to_csv(os.path.join(out_dir, 'ica_mixing_matrix.csv'))
 
-    # Report features directly (back-projection already done in _boot_task)
-    indiv_rep = _build_individual_report_df(all_feats, stats)
-    indiv_rep.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
-    calculate_visualization_data(
-        config, X_full, Y, weights, subject_ids, best_model,
-        indiv_rep, 'individual', X_brain
-    )
+    indiv_df = _build_individual_report_df(all_feats, stats)
 
-
-def _report_none(df_coef, all_feats, stats, config, active_covs,
-                 reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """No reduction: report raw feature coefficients directly."""
-    out_dir = stats['out_dir']
-    rep = _build_individual_report_df(all_feats, stats)
-    rep.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
-    calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model, rep, 'individual', None)
+    if red_method == 'none':
+        indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
+        calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
+                                     indiv_df, 'individual', None)
+    else:
+        indiv_df.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
+        vis_df = indiv_df.rename(columns={'feature': 'cluster_id'}) if red_method == 'cluster_pca' else indiv_df
+        calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
+                                     vis_df, 'individual', X_brain)
 
 
 def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
     """
     Dispatcher: compute shared statistics, then delegate to reduction-specific branch.
-    Applies BH-FDR correction at q=0.05. CovariateScaler penalty_weight adjustment
-    is applied in the preamble when feature_reduction_method is 'none'.
+    Applies BH-FDR correction at q=0.05.
     """
-    stats = _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_model)
+    stats = _compute_importance_preamble(df_coef, all_feats, feat_std_map, config)
     red_method = config['feature_reduction_method']
     branch_args = (df_coef, all_feats, stats, config, active_covs,
                    reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model)
     if red_method == 'apriori':
         _report_apriori(*branch_args)
-    elif red_method == 'cluster_pca':
-        _report_cluster_pca(*branch_args)
-    elif red_method == 'ica':
-        _report_ica(*branch_args)
     else:
-        _report_none(*branch_args)
+        _report_standard(*branch_args)
 
 
-def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, apriori_map=None):
-    """Run per-iteration re-reduction bootstrap importance estimation (conditional bootstrap, Efron & Tibshirani, 1993, Ch. 13).
+def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs):
+    """Reconstruct a representative full-data feature matrix for visualization.
 
-    Setup: fits reducer and tunes hyperparameters once on the full dataset
-    (descriptive pathway) to establish best_params and feat_std_map.
-    Per iteration: clones and refits reducer on resampled brain features, fits model
-    with fixed best_params, back-projects coefficients to original feature space
-    via _backproject_coef_original_space. See _boot_task for iteration-level details.
+    Uses the fold-0 model's reducer (if any) to transform the full X_brain, then
+    prepends covariates. This is a descriptive approximation — the fold-0 reducer
+    was fit on the fold-0 training set only, not the full dataset. It is used only
+    for calculate_visualization_data (descriptive pathway).
+
+    Returns
+    -------
+    X_full_repr : pd.DataFrame
+        Representative assembled feature matrix (covariates + reduced brain).
+    fm0 : dict
+        fold_models[0] record, for access to representative pipeline and feat_std_map.
     """
-    logging.info("--- Bootstrap Importance ---")
-    n_boot = config['stats_params']['n_bootstraps']
+    fm0 = fold_models[0]
+    reducer0 = fm0['reducer']
+    is_pre = config['covariate_method'] == 'pre_regress'
 
-    X_full, best_model, reducer_full, feat_std_map, _, _, best_params = _fit_full_data_model(
-        config, X_brain, Y, weights, X_cov, active_covs, apriori_map
+    if reducer0 is not None:
+        X_brain_red = reducer0.transform(X_brain)
+    else:
+        X_brain_red = X_brain
+
+    if not X_cov.empty and not is_pre:
+        X_full_repr = pd.concat(
+            [X_cov.reset_index(drop=True), X_brain_red.reset_index(drop=True)], axis=1
+        )
+    else:
+        X_full_repr = X_brain_red.reset_index(drop=True)
+
+    return X_full_repr, fm0
+
+
+def _write_tier2_single(coef_pool, feature_names, out_dir, ci_level):
+    """Compute and write Tier 2 inference: pooled fold-wise bootstrap percentile CIs.
+
+    Parameters
+    ----------
+    coef_pool : ndarray, shape (B_total, P)
+        Pooled bootstrap coefficients across all K folds.
+    feature_names : list of str, length P
+        Original brain feature names.
+    out_dir : str
+        Output directory.
+    ci_level : float
+        Confidence level (e.g. 0.95).
+
+    Outputs
+    -------
+    report_fold_bootstrap_ci.csv
+        boot_mean_coef, boot_ci_low, boot_ci_high, pd, p_value,
+        is_significant, is_significant_fdr
+    """
+    alpha_b = 1.0 - ci_level
+    boot_mean = coef_pool.mean(axis=0)
+    boot_ci_low = np.percentile(coef_pool, 100 * alpha_b / 2, axis=0)
+    boot_ci_high = np.percentile(coef_pool, 100 * (1 - alpha_b / 2), axis=0)
+    B = coef_pool.shape[0]
+    pd_val = np.maximum(
+        (coef_pool > 0).sum(axis=0) / B,
+        (coef_pool < 0).sum(axis=0) / B
     )
-    reducer_template = _make_reducer(config, apriori_map)
-    original_feature_names = list(X_brain.columns)
+    p_value = np.clip(2 * (1 - pd_val), 0.0, 1.0)
+    is_sig = (boot_ci_low > 0) | (boot_ci_high < 0)
+    is_sig_fdr = _bh_fdr(p_value, q=0.05)
 
-    # Pass X_cov for both incorporate (to reassemble X_boot with covariates) and
-    # pre_regress (to residualize Y within each iteration).
+    pd.DataFrame({
+        'feature': feature_names,
+        'boot_mean_coef': boot_mean,
+        'boot_ci_low': boot_ci_low,
+        'boot_ci_high': boot_ci_high,
+        'pd': pd_val,
+        'p_value': p_value,
+        'is_significant': is_sig,
+        'is_significant_fdr': is_sig_fdr,
+    }).to_csv(os.path.join(out_dir, 'report_fold_bootstrap_ci.csv'), index=False)
+
+
+def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, fold_models, apriori_map=None):
+    """Run fold-wise pooled bootstrap importance estimation (Tier 2 inference).
+
+    Bootstrap iterations are distributed evenly across all K folds (each fold gets
+    max(n_fold_bootstraps, 50) iterations). Each iteration uses the fold-specific
+    best_params, ensuring tuning variance propagates to the bootstrap distribution.
+    Per-iteration re-reduction (conditional bootstrap, Efron & Tibshirani, 1993, Ch. 13):
+    each iteration clones and refits the reducer on resampled brain features, fits the
+    model in reduced space with fixed best_params, and back-projects coefficients to the
+    invariant original feature space.
+
+    All valid results are pooled across folds for Tier 2 percentile CIs
+    (report_fold_bootstrap_ci.csv). The full pooled distribution is also passed to
+    _compute_importance_report for the standard importance report (report_*_importance.csv).
+    """
+    logging.info("--- Bootstrap Importance (fold-wise, Tier 2) ---")
+    n_fold_bootstraps = _get_n_fold_bootstraps(config)
+    n_cores = config['n_cores']
+    original_feature_names = list(X_brain.columns)
+    red_method = config['feature_reduction_method']
     cov_method = config['covariate_method']
+
+    n_per_fold_repeat = max(n_fold_bootstraps, 50)
+    logging.info(
+        f"Bootstrap: {len(fold_models)} folds x {n_per_fold_repeat} iterations/fold = "
+        f"{len(fold_models) * n_per_fold_repeat} total bootstrap iterations."
+    )
+
     X_cov_for_boot = X_cov if (cov_method != 'none' and X_cov is not None and not X_cov.empty) else None
-    res = Parallel(n_jobs=config['n_cores'])(
+
+    rng_master = np.random.RandomState(42)
+
+    # Pre-generate all (best_params, reducer_template, seed) tasks in fold-sequential order to
+    # preserve reproducibility. A single flat Parallel dispatch reduces joblib pool creation
+    # from K launches to 1, yielding ~5-15% wall-time reduction for typical configs.
+    task_list = []
+    for fm in fold_models:
+        # Use fold-specific reducer template: clone from fitted reducer for type fidelity
+        reducer_tmpl = clone(fm['reducer']) if fm['reducer'] is not None else None
+        for s in rng_master.randint(0, int(1e9), n_per_fold_repeat):
+            task_list.append((fm['best_params'], reducer_tmpl, s))
+
+    all_res = Parallel(n_jobs=n_cores)(
         delayed(_boot_task)(
-            X_brain, Y, weights, s, config, best_params, reducer_template,
+            X_brain, Y, weights, s, config, bp, reducer_tmpl,
             apriori_map=apriori_map,
             X_cov=X_cov_for_boot,
             active_covs=active_covs
         )
-        for s in np.random.RandomState(42).randint(0, int(1e9), n_boot)
+        for bp, reducer_tmpl, s in task_list
     )
 
-    valid_res = [r for r in res if r is not None]
-    n_failed = len(res) - len(valid_res)
-    n_total = len(res)
+    valid_res = [r for r in all_res if r is not None]
+    n_failed = len(all_res) - len(valid_res)
+    n_total = len(all_res)
     if n_failed > 0:
         pct = 100 * n_failed / n_total
         msg = f"Bootstrap: {n_failed}/{n_total} iterations failed ({pct:.1f}%)"
@@ -1826,71 +2319,76 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             logging.info(msg)
 
     n_conv_warn = sum(1 for _, w in valid_res if not w)
-
-    # Determine df_coef column names.
-    # - No reduction: _boot_task returns coefficients for X_boot.columns (covariates + brain).
-    #   Use X_full.columns which matches the assembly order in _boot_task.
-    # - Reduction: _boot_task back-projects to original brain feature space (X_brain.columns).
-    full_feat_names = list(X_full.columns)
-    red_method = config['feature_reduction_method']
-    df_coef_cols = full_feat_names if red_method == 'none' else original_feature_names
-
     if n_conv_warn > 0:
         logging.warning(
             f"ConvergenceWarning in {n_conv_warn}/{len(valid_res)} bootstrap iterations."
         )
 
-    # Save full-data cluster/ICA descriptive outputs
-    if reducer_full is not None and hasattr(reducer_full, 'get_loadings'):
-        pd.DataFrame(reducer_full.get_loadings()).to_csv(
-            os.path.join(config['paths']['output_dir'], 'cluster_loadings.csv'), index=False
-        )
+    # Representative pipeline and X_full for visualization (fold-0 approximation)
+    # Documented as a descriptive approximation: fold-0 reducer fit on fold-0 training data.
+    X_full_repr, fm0 = _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs)
+    best_model_repr = fm0['pipeline']
+    reducer_full_repr = fm0['reducer']
 
-    # feat_std_map and all_feats for importance reporting
+    # feat_std_map for importance reporting
     if red_method == 'none':
-        # feat_std_map is in full feature space (covariates + brain); matches df_coef_cols
-        feat_std_map_report = feat_std_map
-        all_feats_report = full_feat_names
+        if cov_method == 'incorporate':
+            # _boot_task strips covariate coefficients before returning; report
+            # columns must match the brain-only return shape (n_brain,).
+            brain_std = X_brain.std(ddof=1).replace(0, 1.0)
+            feat_std_map_report = brain_std
+            all_feats_report = original_feature_names
+            df_coef_cols = original_feature_names
+        else:
+            # feat_std_map from fm0 covers the full feature set (no covariates
+            # or pre_regress: covariates already residualized out).
+            feat_std_map_report = fm0['feat_std_map']
+            all_feats_report = list(X_full_repr.columns)
+            df_coef_cols = all_feats_report
     else:
-        # For reduction cases, df_coef is in original brain feature space (per-iteration re-reduction).
-        # Use X_brain std as feat_std proxy (scaler was fit on reduced-space features).
-        # NOTE: std_coef_mean is APPROXIMATE after back-projection — it represents the
-        # product of reduced-space standardized coef × loading, divided by original feature
-        # SD. This is NOT equivalent to a standardized beta from direct regression on
-        # original features. The raw_coef_mean and pd (probability of direction) columns
-        # are the primary inferential quantities; std_coef_mean should be interpreted as
-        # relative importance within the analysis only.
+        # Back-projected to original brain feature space
         brain_std = X_brain.std(ddof=1).replace(0, 1.0)
         feat_std_map_report = brain_std
         all_feats_report = original_feature_names
+        df_coef_cols = original_feature_names
+
+    # Save cluster/ICA descriptive outputs from fold-0 reducer (representative)
+    if reducer_full_repr is not None and hasattr(reducer_full_repr, 'get_loadings'):
+        pd.DataFrame(reducer_full_repr.get_loadings()).to_csv(
+            os.path.join(config['paths']['output_dir'], 'cluster_loadings.csv'), index=False
+        )
 
     # Detect multi-output from the first valid result
     sample_coef = valid_res[0][0]
     is_multi = sample_coef.ndim == 2  # True for multi-task regression or multi-class
 
     if not is_multi:
-        # Single-output: each result is (P,) — build df_coef (B, P) as before
-        df_coef = pd.DataFrame([r[0] for r in valid_res], columns=df_coef_cols)
+        coef_matrix = np.stack([r[0] for r in valid_res], axis=0)  # (B, P) — materialised once
+        df_coef = pd.DataFrame(coef_matrix, columns=df_coef_cols)
 
-        # Save distributions if requested
         if config['stats_params'].get('save_distributions', True):
-            coef_dist = np.stack([r[0] for r in valid_res], axis=0)
             np.savez_compressed(
                 os.path.join(config['paths']['output_dir'], 'bootstrap_coef_distribution.npz'),
-                coef_dist=coef_dist,
+                coef_dist=coef_matrix,
                 feature_names=np.array(df_coef_cols)
             )
 
         _compute_importance_report(
             df_coef, all_feats_report, feat_std_map_report, config, active_covs,
-            reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model
+            reducer_full_repr, X_brain, X_full_repr, Y, weights, subject_ids, best_model_repr
+        )
+
+        # Tier 2: pooled bootstrap percentile CIs (always in original brain feature space)
+        _write_tier2_single(
+            coef_matrix,
+            all_feats_report,
+            config['paths']['output_dir'],
+            config['stats_params']['ci_level']
         )
     else:
-        # Multi-output: each result is (K, P) — stack to (B, K, P), then loop over tasks/classes
         coef_array = np.stack([r[0] for r in valid_res], axis=0)  # (B, K, P)
         task_labels = _get_task_labels(Y, config)
 
-        # Save joint distribution if requested
         if config['stats_params'].get('save_distributions', True):
             np.savez_compressed(
                 os.path.join(config['paths']['output_dir'], 'bootstrap_coef_distribution.npz'),
@@ -1904,15 +2402,78 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             os.makedirs(out_dir_k, exist_ok=True)
             config_k = {**config, 'paths': {**config['paths'], 'output_dir': out_dir_k}}
             df_coef_k = pd.DataFrame(coef_array[:, k, :], columns=df_coef_cols)
-            # Pass single-task Y slice so visualization/reporting operates on 1-D outcome
             Y_k = Y.iloc[:, k] if hasattr(Y, 'iloc') and Y.ndim > 1 else Y
             _compute_importance_report(
                 df_coef_k, all_feats_report, feat_std_map_report, config_k, active_covs,
-                reducer_full, X_brain, X_full, Y_k, weights, subject_ids, best_model
+                reducer_full_repr, X_brain, X_full_repr, Y_k, weights, subject_ids, best_model_repr
+            )
+            # Tier 2 per-task
+            _write_tier2_single(
+                coef_array[:, k, :],
+                all_feats_report,
+                out_dir_k,
+                config['stats_params']['ci_level']
             )
 
 
-# --- Step 8: Block Permutation ---
+# --- Ensemble Prediction Utility ---
+
+def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs):
+    """Predict on new data by averaging predictions across all K fold submodels.
+
+    Each fold's reducer is applied to X_brain_new, the assembled feature matrix is
+    passed through the fold's fitted pipeline, and predictions are averaged uniformly
+    across all K folds. Uniform weighting is used: performance weighting is unstable
+    at typical fMRI sample sizes where per-fold R² estimates have high variance
+    (SE(R²) > signal for N/K ~ 20 test observations).
+
+    This utility is not called from main(). It is exposed for downstream use after
+    pipeline execution (e.g., prediction on held-out cohorts).
+
+    Parameters
+    ----------
+    fold_models : list of dict
+        fold_models from run_nested_cv.
+    X_brain_new : pd.DataFrame
+        New brain features, shape (N_new, P).
+    X_cov_new : pd.DataFrame or None
+        New covariate features, shape (N_new, P_cov).
+    config : dict
+        Pipeline configuration.
+    active_covs : list of str
+        Active covariate column names.
+
+    Returns
+    -------
+    y_pred_mean : ndarray, shape (N_new,) or (N_new, K_tasks)
+        Mean prediction across all K fold submodels.
+    y_pred_std : ndarray, shape (N_new,) or (N_new, K_tasks)
+        Standard deviation of predictions across submodels (uncertainty estimate).
+    """
+    is_pre = config['covariate_method'] == 'pre_regress'
+    preds = []
+    for fm in fold_models:
+        reducer = fm['reducer']
+        pipe = fm['pipeline']
+        if reducer is not None:
+            X_br_red = reducer.transform(X_brain_new)
+        else:
+            X_br_red = X_brain_new
+        if (X_cov_new is not None and not X_cov_new.empty
+                and not is_pre):
+            X_new = pd.concat(
+                [X_cov_new.reset_index(drop=True), X_br_red.reset_index(drop=True)], axis=1
+            )
+        else:
+            X_new = X_br_red
+        preds.append(pipe.predict(X_new))
+    preds_arr = np.array(preds)  # shape (K, N_new) or (K, N_new, K_tasks)
+    y_pred_mean = preds_arr.mean(axis=0)
+    y_pred_std = preds_arr.std(axis=0, ddof=1)
+    return y_pred_mean, y_pred_std
+
+
+# --- Step 9: Block Permutation ---
 def _run_block_perm_task(X_brain, X_block_cols, Y, X_cov, active_covs, config, seed, apriori_map=None):
     """Single block permutation iteration: shuffle block column rows, run full nested CV.
 
@@ -1980,8 +2541,14 @@ def main():
     """Entry point for the fmri-elastic-net pipeline.
 
     Supports three execution modes controlled by --mode:
-    - 'main' (default): runs nested CV, selection frequency, bootstrap importance,
+    - 'main' (default): runs nested CV, Tier 1 fold-wise ensemble inference,
+      fold-wise selection frequency, fold-wise bootstrap importance (Tier 2),
       optional label-permutation test, and optional block permutation tests.
+      New output files (relative to output_dir):
+        report_fold_ensemble_importance.csv — Tier 1: fold-wise t-test CIs per feature
+        report_fold_diagnostics.csv         — per-fold hyperparameter records
+        report_fold_params_summary.csv      — mean ± SD across K folds
+        report_fold_bootstrap_ci.csv        — Tier 2: pooled bootstrap percentile CIs
     - 'perm_worker': runs a SLURM array worker subset of permutations and writes
       perm_chunk_{job_id}.csv to the output directory.
     - 'aggregate': collects all perm_chunk_*.csv files, computes the final
@@ -2050,13 +2617,16 @@ def main():
             }).to_csv(os.path.join(out_dir, 'permutation_result.csv'), index=False)
 
         else:  # main mode
-            actual = run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map)
+            actual, fold_models = run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map)
             # Store metric for perm worker label
             _, _, _, metric = create_model_and_param_dist(config, ['dummy'], [], Y=Y)
             config.setdefault('_runtime', {})['metric'] = metric
 
-            run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apriori_map)
-            run_bootstrap(config, X_brain, Y, weights, subj_ids, X_cov, active_covs, apriori_map)
+            # Tier 1 inference: fold-wise ensemble t-test (new Step 5)
+            run_tier1_inference(config, fold_models, X_brain, Y, active_covs)
+
+            run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, fold_models, apriori_map)
+            run_bootstrap(config, X_brain, Y, weights, subj_ids, X_cov, active_covs, fold_models, apriori_map)
             if not args.skip_main_perm:
                 run_permutation_test(
                     config, X_brain, Y, weights, X_cov, active_covs,

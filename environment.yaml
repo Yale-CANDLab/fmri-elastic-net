@@ -2,8 +2,6 @@ name: fmri-elastic-net
 channels:
   - conda-forge
   - defaults
-# Versions pinned to minor release (=X.Y.*) to allow patch-level security updates
-# while preserving API compatibility. Tested against 500/500 tests.
 dependencies:
   - python=3.10
   - pip
