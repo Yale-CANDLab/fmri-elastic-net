@@ -23,9 +23,9 @@ python fmri-elastic-net.py --config CONFIG [--mode MODE] [--job_id JOB_ID]
 
 ### Execution Modes
 
-**`main`**: Runs nested CV (Step 4), selection frequency (Step 6), bootstrap importance
-(Step 7), optionally local permutation test (Step 5), and block permutation (Step 8).
-When `--skip_main_perm` is set, Step 5 is deferred to perm_worker jobs.
+**`main`**: Runs nested CV (Step 4), Tier 1 inference (Step 5), selection frequency (Step 7),
+bootstrap importance (Step 8), optionally local permutation test (Step 6), and block
+permutation (Step 9). When `--skip_main_perm` is set, Step 6 is deferred to perm_worker jobs.
 
 **`perm_worker`**: Runs a subset of permutation iterations determined by `job_id`
 and `n_jobs`. Seeds are split via `np.array_split` over the global seed array.
@@ -73,13 +73,32 @@ decomposition internally for per-class AUC, sensitivity, and specificity.
   identical feature support across all K tasks. Features are jointly selected (non-zero) or
   jointly excluded (zero) for all tasks simultaneously. If tasks have heterogeneous sparsity
   structures, consider running separate single-task `ElasticNet` models.
-- **Sample weights not supported**: `sample_weight_col` is silently ignored when
-  `MultiTaskElasticNet` is the active estimator.
+- **Sample weights via WeightTransformer**: `sample_weight_col` is fully supported for
+  `MultiTaskElasticNet` via a `WeightTransformer` pipeline step that scales both X and Y
+  by sqrt(w_i) before fitting. This is algebraically equivalent to weighted least squares
+  in the loss term. The L1+L2 penalty is invariant to this transformation; alpha is
+  re-tuned on the transformed data.
 
 **Optional column** (advanced):
-- `data_cols.sample_weight_col`: Column of non-negative sample weights. If present,
-  weights are passed to the model's `fit` call where supported. `MultiTaskElasticNet`
-  does not support `sample_weight`; weights are silently ignored for that estimator.
+- `data_cols.sample_weight_col`: Column of non-negative sample weights. Weights are
+  validated (non-negativity enforced) and normalized to sum to N at load time
+  (w_norm = w * N / Σwᵢ). Only relative weights matter; the raw weight scale has no
+  effect on model behavior. For `ElasticNet` and `LogisticRegression`, normalized weights
+  are passed to sklearn's native `sample_weight` argument. For `MultiTaskElasticNet`,
+  weights are applied via sqrt(w_i) pre-transformation of X and Y (see above).
+
+**Weight normalization and diagnostics:**
+Weights are validated and normalized at load time:
+1. **Non-negativity check**: ValueError raised if any weight is negative.
+2. **ESS diagnostic**: effective sample size ESS = (Σwᵢ)² / Σwᵢ² is logged.
+   A warning is issued if ESS/N < 0.5 (weight heterogeneity reduces effective
+   sample size below half the nominal N, which may compromise regularization path
+   stability and bootstrap coverage).
+3. **Normalization**: w_norm = w * (N / Σwᵢ), so normalized weights sum to N.
+   This ensures both weight pathways (sklearn native and WeightTransformer) see
+   consistent, scale-invariant weights. No built-in trimming is applied — this
+   is a user responsibility.
+Reference: Lumley (2010), Complex Surveys; Kish (1965) for ESS.
 
 ---
 
@@ -222,7 +241,7 @@ for single-sample folds). `n_inner_repeats` is silently ignored for LOO inner CV
 | Parameter | Type | Default | Valid values | Description |
 |-----------|------|---------|-------------|-------------|
 | `stats_params.n_permutations` | int | `10000` | Integer ≥ 0 | Number of label permutations for model p-value. Set to `0` to skip |
-| `stats_params.n_bootstraps` | int | `10000` | Integer ≥ 1 | Bootstrap iterations for feature importance CIs and selection frequency |
+| `stats_params.n_fold_bootstraps` | int | `500` | Integer ≥ 1 | Per-fold bootstrap budget for feature importance (Tier 2) and selection frequency. Total iterations = K × n_fold_bootstraps. Deprecated alias: `n_bootstraps` (accepted with a warning; maps to `n_fold_bootstraps`) |
 | `stats_params.n_block_permutations` | int | `500` | Integer ≥ 1 | Permutations per block in block permutation tests. Typical range: 100–1000 |
 | `stats_params.ci_level` | float | `0.95` | (0.0, 1.0) | Confidence level for bootstrap CIs. Also used as percentile threshold for Parallel Analysis eigenvalue comparison |
 | `stats_params.save_distributions` | bool | `true` | `true`, `false` | If `true`, saves the full bootstrap coefficient array (`bootstrap_coef_distribution.npz`) and per-block permutation null scores (`block_perm_null_{label}.csv`). Set to `false` if storage is constrained |
@@ -296,7 +315,7 @@ refit independently per CV fold (or per bootstrap/subsample iteration).
 4. Stores unnormalized mixing matrix as `mixing_unnorm_` (shape P × K).
 5. `transform` applies `scaler` then `ica_.transform` to produce IC activations.
 
-**Descriptor-stage behavior:** For selection frequency and bootstrap (Steps 6–7),
+**Descriptor-stage behavior:** For selection frequency and bootstrap (Steps 7–8),
 reducers are fit on the full dataset. A log message explicitly flags this distinction
 from the fold-local inferential pathway.
 
@@ -350,7 +369,22 @@ Primary performance metric:
 
 **Output:** `nested_cv_scores.csv`, `model_performance.csv`, optionally `confusion_matrix.csv`
 
-### Step 5: Permutation Test (`run_permutation_test`)
+### Step 5: Tier 1 Inference (`run_tier1_inference`)
+
+Runs immediately after nested CV on the K fold-specific coefficient vectors. Always executes
+as part of `main` mode; not skippable.
+
+- For each feature: one-sample t-test across K fold-specific back-projected coefficients
+  (H0: mean fold coefficient = 0)
+- Computes fold mean, SD, and CV (unsigned: |SD/mean|; NaN when |mean| ≤ 1e-30)
+- t-based CI at `ci_level` using dof = K − 1; FDR correction via BH at q = 0.05
+- Per-fold hyperparameter diagnostics (alpha/C, l1_ratio, penalty_weight) and summary
+  statistics (mean ± SD, min, max across K folds) also written here
+
+**Output:** `report_fold_ensemble_importance.csv`, `report_fold_diagnostics.csv`,
+`report_fold_params_summary.csv` (per-task subdirectories for multi-output)
+
+### Step 6: Permutation Test (`run_permutation_test`)
 
 - Seeds: `np.random.RandomState(42).randint(0, 1e9, n_permutations)` — fully reproducible
 - Each iteration: shuffle Y globally via `sklearn.utils.shuffle`, run full nested CV
@@ -365,32 +399,35 @@ Primary performance metric:
 - `permutation_null_distribution_{metric}.csv`
 - `permutation_result.csv` (aggregate mode only)
 
-### Step 6: Selection Frequency (`run_selection_frequency`)
+### Step 7: Selection Frequency (`run_selection_frequency`)
 
-- Setup: calls `_fit_full_data_model` to fit reducer on full data and tune hyperparameters
-- Per iteration (n_bootstraps total, `RandomState(43)` seed sequence):
-  1. Subsample 50% of subjects without replacement
+- Iterations distributed evenly across all K fold models: each fold gets
+  `max(n_fold_bootstraps, 50)` iterations (`RandomState(43)` seed sequence)
+- Per iteration (`_subsample_iter`):
+  1. Subsample 50% of subjects without replacement using fold-specific indices
   2. Fit fresh reducer clone on subsampled brain features (per-iteration re-reduction)
-  3. Fit model with `best_params` (fixed hyperparameters — no re-tuning)
+  3. Fit model with fold-specific `best_params` (fixed hyperparameters — no re-tuning)
   4. Back-project `coef_ != 0` indicators to original feature space via
      `_backproject_coef_original_space`
-- Aggregation: mean of binary non-zero indicators across iterations = selection probability
+- Aggregation: mean of binary non-zero indicators across all iterations = selection probability
 - Multi-output: per-task files written to `output_dir/task_{label}/`; union aggregate
   (selected in ≥ 1 task) written to top-level `output_dir`
 
 **Output:** `report_selection_frequency.csv` (and per-task files for multi-output)
 
-### Step 7: Bootstrap Importance (`run_bootstrap`)
+### Step 8: Bootstrap Importance (`run_bootstrap`)
 
-**Per-iteration re-reduction conditional bootstrap** (Efron & Tibshirani, 1993, Ch. 13):
-- Setup: calls `_fit_full_data_model`; saves `reducer_full`, `best_params`, `feat_std_map`
+**Fold-wise pooled bootstrap** (Tier 2 inference; Efron & Tibshirani, 1993, Ch. 13):
+- Iterations distributed evenly across all K fold models: each fold gets
+  `max(n_fold_bootstraps, 50)` iterations
 - Per iteration (`_boot_task`):
-  1. Weight-aware bootstrap resample with replacement (uses `weights` probability vector
-     if `sample_weight_col` is specified)
-  2. Fit fresh reducer clone on resampled brain features
-  3. Fit model with `best_params` (no re-tuning); catch `ConvergenceWarning` per iteration
+  1. Weight-aware bootstrap resample with replacement (uses normalized `weights` probability
+     vector if `sample_weight_col` is specified)
+  2. Fit fresh reducer clone on resampled brain features (per-iteration re-reduction)
+  3. Fit model with fold-specific `best_params` (no re-tuning); catch `ConvergenceWarning`
   4. Back-project coefficients to original brain feature space via
      `_backproject_coef_original_space`
+- Results pooled across all K folds for Tier 2 percentile CIs (`report_fold_bootstrap_ci.csv`)
 - Failed iterations (exception raised) return `None` and are excluded; a warning is
   logged if > 5% of iterations fail
 - Convergence failures tracked and logged as a count
@@ -411,8 +448,9 @@ Primary performance metric:
 - `ica`: `report_individual_importance.csv`, `ica_mixing_matrix.csv`
 - All methods: `report_{cluster|individual}_plotting.csv` (subject-level visualization data for significant features)
 - When `save_distributions: true`: `bootstrap_coef_distribution.npz`
+- Always: `report_fold_bootstrap_ci.csv` (Tier 2 percentile CIs, pooled across all K folds)
 
-### Step 8: Block Permutation (`run_block_perms`)
+### Step 9: Block Permutation (`run_block_perms`)
 
 - For each block defined in `block_permutation_tests`:
   1. Identify columns matching block definition (substring or list)
@@ -528,6 +566,71 @@ partial residuals of the feature (after regressing out all other features), and 
 Only written if at least one significant feature exists. Produced by
 `calculate_visualization_data`.
 
+### `report_fold_ensemble_importance.csv`
+Tier 1 inference output from `_write_tier1_report`. One-sample t-test across K fold-specific
+coefficient vectors; always written as part of Step 5 (Tier 1 inference).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `feature` | str | Original brain feature name |
+| `fold_mean_coef` | float | Mean coefficient across K folds |
+| `fold_sd_coef` | float | Standard deviation of coefficients across K folds |
+| `fold_cv_coef` | float | Coefficient of variation: \|SD / mean\|; NaN when \|mean\| ≤ 1e-30 |
+| `t_statistic` | float | One-sample t-statistic (H0: mean = 0) |
+| `p_value_t` | float | Two-sided p-value from t-test |
+| `ci_low_t` | float | Lower bound of t-based CI at `ci_level` |
+| `ci_high_t` | float | Upper bound of t-based CI at `ci_level` |
+| `is_significant` | bool | CI does not cross zero — primary Tier 1 inference criterion |
+| `is_significant_fdr` | bool | Survives BH-FDR correction at q = 0.05 |
+
+For multi-task regression or multi-class classification, written to `output_dir/task_{label}/`
+per task/class.
+
+### `report_fold_diagnostics.csv`
+Per-fold hyperparameter records from `_write_fold_diagnostics`. Always written as part of
+Step 5 (Tier 1 inference).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `fold_idx` | int | Outer fold index (0-based) |
+| `alpha_or_C` | float | Best `model__alpha` (regression) or `model__C` (classification) from inner CV |
+| `l1_ratio` | float | Best `model__l1_ratio` from inner CV |
+| `penalty_weight` | float | Best `cov_scaler__penalty_weight`; NaN when `covariate_method != "incorporate"` |
+
+### `report_fold_params_summary.csv`
+Summary statistics across K folds from `_write_fold_diagnostics`. Always written alongside
+`report_fold_diagnostics.csv`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `param` | str | Parameter name (`alpha_or_C`, `l1_ratio`, or `penalty_weight`) |
+| `mean` | float | Mean value across K folds |
+| `sd` | float | Standard deviation across K folds (NaN if K = 1) |
+| `min` | float | Minimum value across K folds |
+| `max` | float | Maximum value across K folds |
+| `n_folds` | int | Number of folds contributing non-NaN values |
+
+Parameters with all-NaN values (e.g., `penalty_weight` when `covariate_method != "incorporate"`)
+are omitted from this file.
+
+### `report_fold_bootstrap_ci.csv`
+Tier 2 inference output from `_write_tier2_single`. Pooled fold-wise bootstrap percentile CIs;
+written as part of Step 8 (Bootstrap Importance) when any bootstrap iterations succeed.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `feature` | str | Original brain feature name |
+| `boot_mean_coef` | float | Mean coefficient across all pooled bootstrap samples |
+| `boot_ci_low` | float | Lower percentile CI bound at `(1 - ci_level) / 2` |
+| `boot_ci_high` | float | Upper percentile CI bound at `1 - (1 - ci_level) / 2` |
+| `pd` | float | Probability of direction: `max(Pr(coef > 0), Pr(coef < 0))` across bootstrap samples |
+| `p_value` | float | Approximate p-value: `clip(2 * (1 - pd), 0, 1)` |
+| `is_significant` | bool | CI does not cross zero — primary Tier 2 inference criterion |
+| `is_significant_fdr` | bool | Survives BH-FDR correction at q = 0.05 |
+
+For multi-task regression or multi-class classification, written to `output_dir/task_{label}/`
+per task/class.
+
 ---
 
 ## 7. Multi-Output Behavior
@@ -587,13 +690,13 @@ sh run_fmri-elastic-net.sh <CONFIG_PATH> <LOG_DIR> <MEM_GB> <CPUS_PER_TASK> <N_J
 | `n_inner_repeats` with LOO inner CV | `n_inner_repeats` silently ignored; `LeaveOneOut` used |
 | P = 1 feature (after reduction) | `_parallel_analysis` returns 1 component; `_compute_distance_matrix` returns zero matrix |
 | `min_cluster_size` larger than P | HDBSCAN assigns all features to noise (label −1); each treated as singleton |
-| `MultiTaskElasticNet` with `sample_weight` | `sample_weight` silently ignored (not supported by estimator) |
+| `MultiTaskElasticNet` with `sample_weight_col` | Weights applied via sqrt(w_i) pre-transformation of X and Y through `WeightTransformer` pipeline step; equivalent to weighted least squares in the loss term |
 | Bootstrap iteration failure | Iteration result is `None`; excluded from CI computation. Warning logged if > 5% of iterations fail |
 | `pd < 0.5` (zero-inflated sparse coefficients) | `p_value` is clipped to 1.0; `is_significant` (CI-based) is unaffected and remains the primary criterion |
 | `pd ≈ 1.0` (anti-conservative failure mode) | May occur when nearly all non-zero bootstrap samples share the same sign. Rare in practice; `is_significant` and `is_significant_fdr` remain valid |
 | Block definition matches 0 columns | Block is skipped with a warning log entry |
 | Multiple blocks (shared seed root) | All blocks use the same seed sequence root (`RandomState(42)`), introducing positive correlation between block null distributions. BH-FDR correction across blocks is valid under PRDS (Benjamini & Yekutieli, 2001) |
-| Conditional bootstrap CI width | Bootstrap conditions on full-data hyperparameters. CIs are slightly narrower than a full double-bootstrap but adequate for typical neuroimaging sample sizes |
+| Conditional bootstrap CI width | Bootstrap conditions on fold-specific hyperparameters (each fold's inner-CV best_params). CIs are slightly narrower than a full double-bootstrap but adequate for typical neuroimaging sample sizes |
 | `raw_coef_mean` with reduction methods | Dividing the back-projected standardized coefficient by original-feature SD is an approximation — not a standardized beta from direct regression on original features. `std_coef_mean` and `pd` are the primary inferential quantities |
 | Selection frequency magnitude | Hyperparameters fixed from full-N tuning are weaker on N/2 subsamples, potentially inflating absolute selection frequencies. Relative ordering is preserved; no significance threshold is applied |
 | LOO with classification | `StratifiedKFold` is used for non-LOO; `LeaveOneOut` cannot stratify. With very small N, class proportions per fold may be unbalanced |
